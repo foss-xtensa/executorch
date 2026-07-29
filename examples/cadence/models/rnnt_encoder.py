@@ -7,15 +7,12 @@
 # Example script for exporting simple models to flatbuffer
 
 import logging
-
-import torch
-
-from executorch.backends.cadence.aot.ops_registrations import *  # noqa
-
 from typing import List, Optional, Tuple
 
+import torch
 from executorch.backends.cadence.aot.export_example import export_and_run_model
-from torchaudio.prototype.models import ConvEmformer
+from executorch.backends.cadence.aot.ops_registrations import *  # noqa
+from torchaudio.models import Emformer
 
 
 FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
@@ -42,14 +39,13 @@ if __name__ == "__main__":
             output = output.contiguous()
             return output, lengths
 
-    class ConvEmformerEncoder(torch.nn.Module):
+    class EmformerEncoder(torch.nn.Module):
         def __init__(
             self,
             *,
             input_dim: int,
             output_dim: int,
             segment_length: int,
-            kernel_size: int,
             right_context_length: int,
             time_reduction_stride: int,
             transformer_input_dim: int,
@@ -70,21 +66,19 @@ if __name__ == "__main__":
                 transformer_input_dim,
                 bias=False,
             )
-            self.transformer = ConvEmformer(
+            self.transformer = Emformer(
                 transformer_input_dim,
                 transformer_num_heads,
                 transformer_ffn_dim,
                 transformer_num_layers,
                 segment_length // time_reduction_stride,
-                kernel_size=kernel_size,
                 dropout=transformer_dropout,
-                ffn_activation=transformer_activation,
+                activation=transformer_activation,
                 left_context_length=transformer_left_context_length,
                 right_context_length=right_context_length // time_reduction_stride,
                 max_memory_size=transformer_max_memory_size,
                 weight_init_scale_strategy=transformer_weight_init_scale_strategy,
                 tanh_on_mem=transformer_tanh_on_mem,
-                conv_activation="silu",
             )
             self.output_linear = torch.nn.Linear(transformer_input_dim, output_dim)
             self.layer_norm = torch.nn.LayerNorm(output_dim)
@@ -124,11 +118,10 @@ if __name__ == "__main__":
 
     # Instantiate model
     time_reduction_stride = 4
-    encoder = ConvEmformerEncoder(
+    encoder = EmformerEncoder(
         input_dim=80,
         output_dim=256,
         segment_length=4 * time_reduction_stride,
-        kernel_size=7,
         right_context_length=1 * time_reduction_stride,
         time_reduction_stride=time_reduction_stride,
         transformer_input_dim=128,

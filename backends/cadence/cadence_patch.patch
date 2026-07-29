@@ -1,0 +1,21 @@
+diff --git a/src/util.h b/src/util.h
+index 164e3cf..819061f 100644
+--- a/src/util.h
++++ b/src/util.h
+@@ -260,11 +260,11 @@ inline void MakeTmpdir(std::string* path) {
+ }
+ #else
+ inline void MakeTmpdir(std::string* path) {
+-  if (!path->empty()) {
+-	int err = mkdir(path->c_str(), 0755);
+-	if (err == 0 || errno == EEXIST) return;
+-  }
+-  mkdir("/tmp/gflags_unittest", 0755);
++ //  if (!path->empty()) {
++	// int err = mkdir(path->c_str(), 0755);
++	// if (err == 0 || errno == EEXIST) return;
++ //  }
++ //  mkdir("/tmp/gflags_unittest", 0755);
+ }
+ #endif
+ 

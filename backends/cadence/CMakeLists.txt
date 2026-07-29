@@ -77,17 +77,25 @@ endif()
 
 if(EXECUTORCH_NNLIB_OPT)
   set(TARGET_DIR hifi)
-  add_subdirectory(
-    ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib
-    ${EXECUTORCH_ROOT}/runtime/core/portable_type/c10
-  )
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
+elseif(EXECUTORCH_HIFI_CORE STREQUAL "hifi1" OR EXECUTORCH_HIFI_CORE STREQUAL
+                                                "hifi4"
+)
+  add_compile_definitions(CORE_HIFI5=0)
+  list(APPEND EXECUTORCH_EXTRA_BUCK_FLAGS "--config" "cadence.hifi_core=hifi4")
+  set(TARGET_DIR hifi)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
+elseif(EXECUTORCH_HIFI_CORE STREQUAL "hifi5")
+  add_compile_definitions(CORE_HIFI5=1)
+  list(APPEND EXECUTORCH_EXTRA_BUCK_FLAGS "--config" "cadence.hifi_core=hifi5")
+  set(TARGET_DIR hifi)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
 elseif(EXECUTORCH_FUSION_G3_OPT)
   set(TARGET_DIR fusion_g3)
-  add_subdirectory(
-    ${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib
-    ${EXECUTORCH_ROOT}/runtime/core/portable_type/c10
-  )
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
 elseif(EXECUTORCH_VISION_OPT)
   set(TARGET_DIR vision)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
@@ -132,6 +140,45 @@ if(EXECUTORCH_BUILD_CADENCE_RUNNER)
   endif()
   target_link_options(cadence_executor_runner PRIVATE -static -lm)
 endif()
+
+# Cadence simulation runner: targets the Xtensa ISS (xt-run / xt-run --turbo).
+# Reads a .pte via xt-run semi-hosting, runs the first method, prints/dumps IO,
+# and can verify BundledIO. No gflags, no threadpool.
+#
+# Add BundledIO (.bpte) support with: -DEXECUTORCH_BUILD_CADENCE_BUNDLE_IO=ON
+option(EXECUTORCH_BUILD_CADENCE_BUNDLE_IO
+       "Compile BundledIO (.bpte) support into cadence_executor_runner_sim" OFF
+)
+add_executable(cadence_executor_runner_sim executor_runner_sim.cpp)
+target_compile_definitions(
+  cadence_executor_runner_sim PRIVATE ET_ENABLE_ENUM_STRINGS=0
+)
+target_include_directories(
+  cadence_executor_runner_sim
+  PRIVATE ${_common_include_directories} ${CMAKE_BINARY_DIR}
+          ${CMAKE_BINARY_DIR}/include
+)
+if(EXECUTORCH_BUILD_CADENCE_BUNDLE_IO)
+  if(NOT TARGET bundled_program)
+    message(
+      FATAL_ERROR
+        "EXECUTORCH_BUILD_CADENCE_BUNDLE_IO=ON requires the bundled_program "
+        "target; configure with -DEXECUTORCH_BUILD_DEVTOOLS=ON."
+    )
+  endif()
+  target_compile_definitions(
+    cadence_executor_runner_sim PRIVATE ET_BUNDLE_IO_ENABLED
+  )
+  target_link_libraries(cadence_executor_runner_sim PRIVATE bundled_program)
+endif()
+target_link_libraries(
+  cadence_executor_runner_sim PRIVATE executorch extension_data_loader
+                                      extension_runner_util cadence_ops_lib
+)
+if(EXECUTORCH_VISION_OPT OR EXECUTORCH_FUSION_G3_OPT)
+  target_link_options(cadence_executor_runner_sim PRIVATE -lidma)
+endif()
+target_link_options(cadence_executor_runner_sim PRIVATE -static -lm)
 
 # Cadence op-level gtest tests, cross-compiled for the Xtensa ISS (run via
 # xt-run). Built only when EXECUTORCH_BUILD_CADENCE_OP_TESTS is ON and the

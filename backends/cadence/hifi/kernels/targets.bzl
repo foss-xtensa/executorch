@@ -6,6 +6,18 @@ def define_common_targets():
         "//executorch/runtime/kernel:kernel_includes",
     ]
 
+    hifi_core = read_config("cadence", "hifi_core", "")
+
+    dynamic_exported_deps = []
+    if hifi_core == "hifi5":
+        dynamic_exported_deps.append(
+            "fbsource//third-party/nnlib-hifi5/xa_nnlib:libxa_nnlib_common"
+        )
+    else:
+        dynamic_exported_deps.append(
+            "fbsource//third-party/nnlib-hifi4/xa_nnlib:libxa_nnlib_common"
+        )
+
     runtime.cxx_library(
         name = "kernels",
         srcs = ["kernels.cpp"],
@@ -15,8 +27,6 @@ def define_common_targets():
         deps = common_deps,
         compatible_with = ["ovr_config//cpu:xtensa"],
         visibility = ["PUBLIC"],
-        exported_deps = [
-            "fbsource//third-party/nnlib-hifi4/xa_nnlib:libxa_nnlib_common",
-        ],
+        exported_deps = dynamic_exported_deps,
         platforms = CXX,
     )
