@@ -2,16 +2,8 @@
 
 This guide builds the Cadence HiFi backend **manually**, one stage at a time,
 documenting each command, the ExecuTorch install subset, and every
-Cadence-internal CMake flag.
-
-For a one-shot build, run the script:
-
-```bash
-./backends/cadence/build_cadence_hifi.sh
-```
-
-Follow the manual stages below when you need to customize the flow, debug a
-failure, or integrate the build into a larger system.
+Cadence-internal CMake flag. Follow the manual stages when you need to customize
+the flow, debug a failure, or integrate the build into a larger system.
 
 ---
 
@@ -22,7 +14,6 @@ Ensure the following are installed and available on your host before building:
 *   **Python:** **3.12-3.13**, in an active virtual environment.
 *   **Host Compiler (C++17):** `GCC` **12** or `Clang` **5.0+**.
 *   **System Assembler (`binutils`):** **2.40+** (for AVX-512/BF16 host kernels).
-*   **`buck2` build system.** [[_Installation_](https://buck2.build/docs/getting_started/install/)]
 *   **Cadence Xtensa toolchain** binaries reachable on your `PATH`
     (`xt-clang`, `xt-ld`, `xt-run`, ...).
 
@@ -70,7 +61,8 @@ python --version
 ## 3. Environment Configuration
 
 Export the variables that point at your local Xtensa installation and target
-core. The Xtensa toolchain **requires** `XTENSA_CORE`; the HiFi kernel set you
+core, and put the toolchain binaries (`xt-clang`, `xt-ld`, `xt-run`, ...) on your
+`PATH`. The Xtensa toolchain **requires** `XTENSA_CORE`; the HiFi kernel set you
 build is chosen separately in [Stage 1](#stage-1--choose-the-hifi-core) (see
 [Cadence flags](#63-cadence-internal-cmake-flags)).
 
@@ -88,6 +80,9 @@ export XTENSA_SYSTEM=${XTENSA_TOOLCHAIN}/${TOOLCHAIN_VER}/XtensaTools/config/
 
 # Target core configuration profile (e.g. AE_HiFi5s_LE5_AO_FP_XC)
 export XTENSA_CORE=your_hifi_core_name
+
+# Put the toolchain binaries (xt-clang, xt-ld, xt-run, ...) on PATH
+export PATH=${XTENSA_TOOLCHAIN}/${TOOLCHAIN_VER}/XtensaTools/bin:$PATH
 ```
 
 **Csh / Tcsh:**
@@ -97,6 +92,7 @@ setenv XTENSA_TOOLCHAIN /path/to/XtDevTools/install/tools
 setenv TOOLCHAIN_VER your_release_version
 setenv XTENSA_SYSTEM ${XTENSA_TOOLCHAIN}/${TOOLCHAIN_VER}/XtensaTools/config/
 setenv XTENSA_CORE your_hifi_core_name
+setenv PATH ${XTENSA_TOOLCHAIN}/${TOOLCHAIN_VER}/XtensaTools/bin:${PATH}
 ```
 
 ---
@@ -115,7 +111,7 @@ Set the HiFi version you are targeting. Accepted values are `hifi1`, `hifi4`, or
 run on any Xtensa core without the HiFi NN libraries.
 
 ```bash
-HIFI_CORE=hifi5   # or hifi1 / hifi4; empty for the generic (portable) kernels
+export HIFI_CORE=hifi5   # or hifi1 / hifi4; empty for the generic (portable) kernels
 ```
 
 ### Stage 2 - Prepare the source tree
@@ -185,6 +181,34 @@ This populates:
 
 ### Stage 5 - Configure the cross-compile for the Xtensa target
 
+> **NOTE - Host compiler.** Although the target is Xtensa, this stage still needs
+> a working **host** GCC / binutils. The build compiles host-side tooling such as
+> `flatcc`, which generates the FlatBuffers headers that `libexecutorch.a` is
+> built against. **On an old GCC / binutils the build will fail** (missing
+> AVX-512/BF16 assembler support, stale FlatBuffers header handling, etc.). We
+> recommend **GCC 12** with **binutils 2.40+**; the versions verified for this
+> guide are **GCC 12.4.0** and **binutils 2.40**.
+>
+> If the required GCC / binutils are not the system default (common on
+> shared/managed hosts), point the build at them explicitly *before* configuring -
+> edit the two roots to match your environment:
+>
+> ```bash
+> GCC_ROOT=/path/to/gcc/v12.4.0
+> BINUTILS_ROOT=/path/to/binutils/v2.40
+>
+> export LD_LIBRARY_PATH="${GCC_ROOT}/lib64:${LD_LIBRARY_PATH}"   # GCC 12 runtime libs
+> export PATH="${BINUTILS_ROOT}/bin:${GCC_ROOT}/bin:${PATH}"      # new binaries first
+> export CC="${GCC_ROOT}/bin/gcc"
+> export CXX="${GCC_ROOT}/bin/g++"
+> export CFLAGS="-B${BINUTILS_ROOT}/bin/"                         # use new assembler/linker
+> export CXXFLAGS="-B${BINUTILS_ROOT}/bin/"
+> ```
+>
+> Verify with `which gcc g++ ld`, `gcc --version` (12.x), and `ld --version`
+> (2.40+) before configuring. The `CXXFLAGS` below extends this value; the
+> `-B...` redirect is preserved.
+
 Configure CMake with the Cadence cross toolchain. Key options:
 
 *   `CXXFLAGS="-fno-exceptions -fno-rtti"` - the Xtensa runtime is built without
@@ -197,7 +221,7 @@ Configure CMake with the Cadence cross toolchain. Key options:
 *   `-DCMAKE_PREFIX_PATH=...` - points at the host package built in Stage 3.
 
 ```bash
-CXXFLAGS="-fno-exceptions -fno-rtti" cmake \
+CXXFLAGS="-fno-exceptions -fno-rtti ${CXXFLAGS:-}" cmake \
     -DCMAKE_PREFIX_PATH="${PWD}/cmake-out/lib/cmake/ExecuTorch" \
     -DCMAKE_TOOLCHAIN_FILE=./backends/cadence/cadence.cmake \
     -DCMAKE_INSTALL_PREFIX=cmake-out \
@@ -209,10 +233,14 @@ CXXFLAGS="-fno-exceptions -fno-rtti" cmake \
     -DEXECUTORCH_BUILD_EXTENSION_RUNNER_UTIL=ON \
     -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
     -DEXECUTORCH_ENABLE_LOGGING=ON \
-    -DEXECUTORCH_ENABLE_PROGRAM_VERIFICATION=ON \
+    -DEXECUTORCH_BUILD_EXTENSION_EVALUE_UTIL=OFF \
+    -DEXECUTORCH_ENABLE_PROGRAM_VERIFICATION=OFF \
     -DEXECUTORCH_BUILD_PORTABLE_OPS=ON \
     -DPYTHON_EXECUTABLE=python3 \
     -DEXECUTORCH_HIFI_CORE="$HIFI_CORE" \
+    -DEXECUTORCH_XNNPACK_SHARED_WORKSPACE=OFF \
+    -DEXECUTORCH_XNNPACK_ENABLE_KLEIDI=OFF \
+    -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=OFF \
     -DEXECUTORCH_USE_DL=OFF \
     -DHAVE_FNMATCH_H=OFF \
     -DFLATCC_ALLOW_WERROR=OFF \
@@ -561,5 +589,14 @@ Script equivalent: `./backends/cadence/build_cadence_hifi.sh --tests`.
 
 *   **FlatBuffers / stdlib header errors with GCC 14/15:** switch to GCC 12/13 or
     Clang; bleeding-edge toolchains break third-party submodules.
-ENDOFDOC
-echo "appended; total lines:"; wc -l backends/cadence/README_HIFI.md
+
+---
+
+## 8. Reference Script
+
+[`build_cadence_hifi.sh`](build_cadence_hifi.sh) wires Stages 2-7 together into a
+single script. It is provided as a **reference example** of one working
+configuration - it encodes specific choices (a fixed install subset, `-j8`, an
+`add.pte` smoke test) that will not fit every setup. Prefer the manual stages
+above and treat this script as a starting point to copy and adapt, not a
+drop-in build for all environments.
