@@ -296,8 +296,11 @@ program with reference IO). The entry points live in
     pipeline (prepare -> calibrate -> convert -> quantize -> lower) and writes the
     `.pte` / `.bpte`. Returns the `ExecutorchProgramManager`.
 *   **`export_and_run_model(model, example_inputs, ...)`** - calls `export_model`,
-    and (only when `verify=True`) runs the result on the ISS and compares against
-    the eager reference outputs.
+    and (only when `verify=True`) runs the exported `.pte` through a host GCC
+    build of the runner to verify the program is not corrupted. This does **not**
+    use `xt-run` or the Xtensa ISS — it is a host-side sanity check only.
+    Enabling `verify` also overwrites the default `cmake-out` build directory.
+    Keep `verify=False` (the default) unless you explicitly need this check.
 
 ### 5.1 Example models
 
@@ -325,17 +328,13 @@ python3 -m examples.cadence.models.mobilenet_v2
 | `model` | *(required)* | The `nn.Module` to export (set to `eval()` for inference models). |
 | `example_inputs` | *(required)* | Tuple of example input tensors defining the input shapes/dtypes. |
 | `file_name` | `"CadenceDemoModel"` | Base name for the output `.pte` / `.bpte`. |
-| `verify` | `False` | When `True`, run the exported program on the ISS and compare against eager reference outputs. When `False` (default), only export - no execution. |
-| `opt_level` | `1` | Cadence optimization level for lowering. |
-| `mem_algo` | `0` | Memory-planning algorithm selector. |
-| `edge_passes_config` | `None` | Optional `EdgePassesConfig` to toggle edge passes (e.g. `use_im2row_transform=True`). |
-| `additional_quantizers` | `None` | Extra quantizers, prepended so they take priority over the A8W8 defaults. |
+| `verify` | `False` | When `True`, run the exported `.pte` through a host GCC build of the runner to verify the program is not corrupted (host-side check only — does **not** use `xt-run` or the Xtensa ISS). Also overwrites the default `cmake-out` directory. **Recommended to keep disabled.** |
 | `eps_error` / `eps_warn` | `1e-1` / `1e-5` | Error/warning thresholds used only when `verify=True`. |
 | `force_rebuild` | `False` | Force the runtime rebuild during verification. |
+| `working_dir` | `None` | Directory for output `.pte` / `.bpte` files. If `None`, a fresh temporary directory under `/tmp` is created automatically. |
 
 `export_model` accepts the same export-related parameters (`file_name`,
-`working_dir`, `opt_level`, `mem_algo`, `edge_passes_config`,
-`additional_quantizers`) but does no execution.
+`working_dir`) but does no execution.
 
 ### 5.3 Locating the exported file
 

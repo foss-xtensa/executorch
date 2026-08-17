@@ -106,10 +106,12 @@ def export_and_run_model(
     eps_warn: float = 1e-5,
     force_rebuild: bool = False,
     verify: bool = False,
+    working_dir: Optional[str] = None,
 ):
     # create work directory for outputs and model binary
-    working_dir = tempfile.mkdtemp(dir="/tmp")
-    logging.debug(f"Created work directory {working_dir}")
+    if working_dir is None:
+        working_dir = tempfile.mkdtemp(dir="/tmp")
+        logging.debug(f"Created work directory {working_dir}")
     exec_prog = export_model(
         model,
         example_inputs,
