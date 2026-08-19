@@ -187,7 +187,7 @@ This populates:
 
 ### Stage 5 - Configure the Cross-Compile for the Xtensa Target
 
-**Prerequisites to Configure the Cross-Compile** 
+**Prerequisites to Configure the Cross-Compile**  
 Although the target is Xtensa, this stage still needs a working **host** GCC/binutils. This stage builds host-side tools such as `flatcc`, which generates the FlatBuffers headers required to build `libexecutorch.a`. **Older versions of GCC or binutils can cause build failures** (as of missing AVX-512/BF16 assembler support, stale FlatBuffers header handling, and so on). Cadence recommends using **GCC 12** and **binutils 2.40 or later**. This guide was validated with **GCC 12.4.0** and **binutils 2.40**.
 If the required GCC or binutils version is not the system default (common on shared or managed hosts), set the installation path before you configure the build. Update the following root directory paths to match your environment.
 
