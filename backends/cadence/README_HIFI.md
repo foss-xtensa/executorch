@@ -1,28 +1,49 @@
 # Building ExecuTorch for the Cadence HiFi DSP
 
-This guide builds the Cadence HiFi backend **manually**, one stage at a time,
-documenting each command, the ExecuTorch install subset, and every
-Cadence-internal CMake flag. Follow the manual stages when you need to customize
-the flow, debug a failure, or integrate the build into a larger system.
+This README helps you build the Cadence HiFi backend with one stage at a time. It explains each command, the ExecuTorch installation options, and Cadence-specific CMake flags. Use these stages to customize the build flow, troubleshoot issues, or integrate the build.
+## Table of Contents
+
+*   [1. Prerequisites](#1-prerequisites)
+*   [2. Python Virtual Environment Setup](#2-python-virtual-environment-setup)
+*   [3. Environment Configuration](#3-environment-configuration)
+*   [4. Build Stages](#4-build-stages)
+    *   [Stage 1 - Select the HiFi Core](#stage-1---select-the-hifi-core)
+    *   [Stage 2 - Prepare the Source Tree](#stage-2---prepare-the-source-tree)
+    *   [Stage 3 - Install the Host ExecuTorch Package](#stage-3---install-the-host-executorch-package)
+    *   [Stage 4 - Fetch Cadence NN Libraries and FACTO](#stage-4---fetch-cadence-nn-libraries-and-facto)
+    *   [Stage 5 - Configure the Cross-Compile for the Xtensa Target](#stage-5---configure-the-cross-compile-for-the-xtensa-target)
+    *   [Stage 6 - Build and Install Runtime Components](#stage-6---build-and-install-runtime-components)
+    *   [Stage 7 - Run Model On the Xtensa ISS](#stage-7---run-model-on-the-xtensa-iss)
+*   [5. Exporting Models to `.pte`](#5-exporting-models-to-pte)
+    *   [5.1 Example Models](#51-example-models)
+    *   [5.2 `export_and_run_model` parameters](#52-export_and_run_model-parameters)
+    *   [5.3 Locating the Exported File](#53-locating-the-exported-file)
+*   [6. Verification of Models](#6-verification-of-models)
+*   [7. Additional Information](#7-additional-information)
+    *   [7.1 Runner and Xtensa ISS Details](#71-runner-and-xtensa-iss-details)
+    *   [7.2 The ExecuTorch Install Subset](#72-the-executorch-install-subset)
+    *   [7.3 Cadence-internal CMake Flags](#73-cadence-internal-cmake-flags)
+    *   [7.4 Optional Build Features](#74-optional-build-features)
+*   [8. Troubleshooting](#8-troubleshooting)
+*   [9. Reference Script](#9-reference-script)
 
 ---
 
 ## 1. Prerequisites
 
-Ensure the following are installed and available on your host before building:
+Ensure that you install the following tools on the host system before you begin the build process.
 
-*   **Python:** **3.12-3.13**, in an active virtual environment.
-*   **Host Compiler (C++17):** `GCC` **12** or `Clang` **5.0+**.
-*   **System Assembler (`binutils`):** **2.40+** (for AVX-512/BF16 host kernels).
-*   **Cadence Xtensa toolchain** binaries reachable on your `PATH`
-    (`xt-clang`, `xt-ld`, `xt-run`, ...).
+*   **Python:** **3.12-3.13**, in an active virtual environment
+*   **Host Compiler (C++17):** `GCC` **12** or `Clang` **5.0** and later.
+*   **System Assembler (`binutils`):** **2.40** and later (for AVX-512/BF16 host kernels)
+*   **Cadence Xtensa toolchain** binaries accessible on your system `PATH`
+    (`xt-clang`, `xt-ld`, `xt-run`, and so on)
 
 ---
 
 ## 2. Python Virtual Environment Setup
 
-Always use a clean environment to isolate dependencies and prevent library
-pollution. Run these from the `executorch` root directory.
+Use a clean environment to isolate dependencies and avoid library conflicts. Run the following commands from the `executorch` root directory.
 
 **Bash / Zsh:**
 
@@ -60,25 +81,22 @@ python --version
 
 ## 3. Environment Configuration
 
-Export the variables that point at your local Xtensa installation and target
-core, and put the toolchain binaries (`xt-clang`, `xt-ld`, `xt-run`, ...) on your
-`PATH`. The Xtensa toolchain **requires** `XTENSA_CORE`; the HiFi kernel set you
-build is chosen separately in [Stage 1](#stage-1--choose-the-hifi-core) (see
-[Cadence flags](#63-cadence-internal-cmake-flags)).
+Export the variables that point to your local Xtensa installation and target core, and add the toolchain binaries (`xt-clang`, `xt-ld`, `xt-run`, and so on) on your system `PATH`. The Xtensa toolchain **requires** `XTENSA_CORE` environment variable. Select the HiFi core family separately in [Stage 1](#stage-1---select-the-hifi-core) (For more information, refer to
+[Cadence flags](#73-cadence-internal-cmake-flags)).
 
 **Bash / Zsh:**
 
 ```bash
-# Path to the Xtensa tools install dir (e.g. /opt/Xtensa/XtDevTools/install/tools)
+# Path to the Xtensa tools install dir (For example, /opt/Xtensa/XtDevTools/install/tools)
 export XTENSA_TOOLCHAIN=/path/to/XtDevTools/install/tools
 
-# Toolchain version release string (e.g. RI-2023.11-linux)
+# Toolchain version release string (For example, RI-2023.11-linux)
 export TOOLCHAIN_VER=your_release_version
 
 # Xtensa configuration registry directory
 export XTENSA_SYSTEM=${XTENSA_TOOLCHAIN}/${TOOLCHAIN_VER}/XtensaTools/config/
 
-# Target core configuration profile (e.g. AE_HiFi5s_LE5_AO_FP_XC)
+# Target core configuration profile (For example,  AE_HiFi5s_LE5_AO_FP_XC)
 export XTENSA_CORE=your_hifi_core_name
 
 # Put the toolchain binaries (xt-clang, xt-ld, xt-run, ...) on PATH
@@ -97,27 +115,22 @@ setenv PATH ${XTENSA_TOOLCHAIN}/${TOOLCHAIN_VER}/XtensaTools/bin:${PATH}
 
 ---
 
-## 4. Manual Build - Stage by Stage
+## 4. Build Stages
 
-Run every command below from the `executorch` root with your virtual environment
-active (Section 2) and the `XTENSA_*` variables exported (Section 3). Bash / Zsh
-syntax is shown; adapt variable assignments for Csh/Tcsh if needed.
+Run the following commands from the `executorch` root with your virtual environment activated (see [Section 2](#2-python-virtual-environment-setup)) and the `XTENSA_*` environment variables set (see [Section 3](#3-environment-configuration)). The examples use Bash/Zsh syntax. If you use Csh/Tcsh, adjust the variable assignments as needed.
 
-### Stage 1 - Choose the HiFi core
+### Stage 1 - Select the HiFi Core
 
-Set the HiFi version you are targeting. Accepted values are `hifi1`, `hifi4`, or
-`hifi5`; it is passed to CMake later as `-DEXECUTORCH_HIFI_CORE`. Leave it empty
-(or set any other value) to fall back to the portable `generic` kernels, which
-run on any Xtensa core without the HiFi NN libraries.
+Specify the target HiFi version. Valid values are `hifi1`, `hifi4`, or `hifi5`. This value is passed to CMake as `-DEXECUTORCH_HIFI_CORE`. If you leave the value unset or specify an unsupported value, the build uses the portable 'generic' kernels that run on any Xtensa core without the HiFi NN libraries.
 
 ```bash
 export HIFI_CORE=hifi5   # or hifi1 / hifi4; empty for the generic (portable) kernels
 ```
 
-### Stage 2 - Prepare the source tree
+### Stage 2 - Prepare the Source Tree
 
-Clear any stale prefix path, sync and update submodules, and apply the Cadence
-gflags patch. The patch step is idempotent (it detects an already-applied patch).
+Clear any existing prefix path, synchronize and update the submodules, and apply the Cadence gflags patch. The patch operation detects whether the patch has already been applied.
+> NOTE: Make sure you are in `rel_hifi` branch before you start.
 
 ```bash
 unset CMAKE_PREFIX_PATH
@@ -129,14 +142,9 @@ git submodule update --init --recursive
 ./backends/cadence/cadence_apply_patch.sh
 ```
 
-### Stage 3 - Install the host / AOT ExecuTorch package
+### Stage 3 - Install the Host ExecuTorch Package
 
-This produces the Python package used to export models and the host-side
-ExecuTorch CMake config (`cmake-out/lib/cmake/ExecuTorch`) that the cross-compile
-links against. Rather than a full install, use the curated `CMAKE_ARGS` subset
-below - it disables host backends/kernels the DSP flow never uses. See
-[Section 6.2](#62-the-executorch-install-subset) for why each flag is off and how
-this differs from `--minimal`.
+This step builds the Python package used to export models and generates the host-side ExecuTorch CMake configuration files (`cmake-out/lib/cmake/ExecuTorch`) required for cross-compilation. Instead of performing a full installation, use the curated `CMAKE_ARGS` configuration shown below. This configuration clears the host backends and kernels that are not used in the DSP workflow. For an explanation of each option and a comparison with the `--minimal` configuration, see [Section 7.2](#72-the-executorch-install-subset).
 
 ```bash
 export CMAKE_ARGS="\
@@ -159,14 +167,11 @@ export CMAKE_ARGS="\
 unset CMAKE_ARGS
 ```
 
-You only need this stage when Python deps or the host build change. For plain
-kernel/operator recompiles, skip it (see the Rebuilds note at the end of this
-section).
+Run this stage only when Python dependencies or the host build change. Skip this stage for executorch runner recompiles. See Rebuilds note at the end of this section.
 
-### Stage 4 - Fetch Cadence NN libraries and FACTO
+### Stage 4 - Fetch Cadence NN Libraries and FACTO
 
-Clone the vendor kernel libraries and install the FACTO operator-testing package
-(editable). Already-cloned repos are skipped, so this is safe to re-run.
+Clone the Cadence HiFi kernel libraries and install the FACTO operator-testing package in editable mode. The process skips repositories that have already been cloned, so it is safe to rerun this step.
 
 ```bash
 ./backends/cadence/install_requirements.sh
@@ -176,10 +181,9 @@ This populates:
 
 *   `nnlib-hifi4`  -> `hifi/third-party/nnlib/nnlib-hifi4`
 *   `nnlib-hifi5`  -> `hifi/third-party/nnlib/nnlib-hifi5`
-*   `nnlib-FusionG3` (pinned commit) -> `fusion_g3/third-party/nnlib/nnlib-FusionG3`
 *   `FACTO`        -> `pip install -e backends/cadence/utils/FACTO`
 
-### Stage 5 - Configure the cross-compile for the Xtensa target
+### Stage 5 - Configure the Cross-Compile for the Xtensa Target
 
 > **NOTE - Host compiler.** Although the target is Xtensa, this stage still needs
 > a working **host** GCC / binutils. The build compiles host-side tooling such as
@@ -189,9 +193,9 @@ This populates:
 > recommend **GCC 12** with **binutils 2.40+**; the versions verified for this
 > guide are **GCC 12.4.0** and **binutils 2.40**.
 >
-> If the required GCC / binutils are not the system default (common on
-> shared/managed hosts), point the build at them explicitly *before* configuring -
-> edit the two roots to match your environment:
+> If the required GCC or binutils are not the system default (common on
+> shared/managed hosts), set the installation path *before* you configure the build. Update the
+> following root directory paths to match your environment.
 >
 > ```bash
 > GCC_ROOT=/path/to/gcc/v12.4.0
@@ -205,20 +209,13 @@ This populates:
 > export CXXFLAGS="-B${BINUTILS_ROOT}/bin/"
 > ```
 >
-> Verify with `which gcc g++ ld`, `gcc --version` (12.x), and `ld --version`
-> (2.40+) before configuring. The `CXXFLAGS` below extends this value; the
-> `-B...` redirect is preserved.
+> Before configuring the build, verify that you use the correct GCC and binutils versions. Run `which gcc g++ ld`, and then verify the versions by running `gcc --version` and `ld --version`. Use GCC 12.x and binutils 2.40 or later. The `CXXFLAGS` setting shown below extends this configuration and preserves the `-B` path redirection.
 
-Configure CMake with the Cadence cross toolchain. Key options:
-
-*   `CXXFLAGS="-fno-exceptions -fno-rtti"` - the Xtensa runtime is built without
-    C++ exceptions or RTTI.
-*   `-DCMAKE_TOOLCHAIN_FILE=backends/cadence/cadence.cmake` - selects the Xtensa
-    cross toolchain (`xt-clang` / `xt-ld`) using your `XTENSA_*` env vars.
-*   `-DEXECUTORCH_BUILD_CADENCE=ON` / `-DEXECUTORCH_HIFI_CORE="$HIFI_CORE"` - the
-    Cadence-internal switches described in
-    [Section 6.3](#63-cadence-internal-cmake-flags).
-*   `-DCMAKE_PREFIX_PATH=...` - points at the host package built in Stage 3.
+Configure CMake with Cadence cross-compilation tool chain. Options include:
+*   `CXXFLAGS="-fno-exceptions -fno-rtti"` - The Xtensa runtime is built without C++ exceptions or RTTI.
+*   `-DCMAKE_TOOLCHAIN_FILE=backends/cadence/cadence.cmake` - Selects the Xtensa cross toolchain (`xt-clang` / `xt-ld`) using your `XTENSA_*` environment variables.
+*   `-DEXECUTORCH_BUILD_CADENCE=ON` / `-DEXECUTORCH_HIFI_CORE="$HIFI_CORE"` - The Cadence-internal switches described in [Section 7.3](#73-cadence-internal-cmake-flags).
+*   `-DCMAKE_PREFIX_PATH=...` - Points at the host package built in [Stage 3](#stage-3---install-the-host-executorch-package).
 
 ```bash
 CXXFLAGS="-fno-exceptions -fno-rtti ${CXXFLAGS:-}" cmake \
@@ -247,16 +244,15 @@ CXXFLAGS="-fno-exceptions -fno-rtti ${CXXFLAGS:-}" cmake \
     -Bcmake-out
 ```
 
-To enable BundledIO or the op tests, add the extra flags described in
-[Section 6.4](#64-optional-build-features) to this command.
+To enable BundledIO or the output validation tests, add the extra flags described in [Section 7.4](#74-optional-build-features) to this command.
 
-### Stage 6 - Build and install
+### Stage 6 - Build and Install Runtime Components
 
 ```bash
 cmake --build cmake-out --target install --config Release -j8
 ```
 
-### Stage 7 - Run on the Xtensa ISS
+### Stage 7 - Run a Model on the Xtensa ISS
 
 Run a `.pte` on the instruction-set simulator with the runner built above:
 
@@ -264,58 +260,48 @@ Run a `.pte` on the instruction-set simulator with the runner built above:
 xt-run --turbo cmake-out/backends/cadence/cadence_executor_runner_sim --model_path=add.pte
 ```
 
-`add.pte` is a trivial model you can generate with the portable AOT export flow:
+Generate `add.pte` simple example model using the portable AOT export workflow.
 
 ```bash
 python3 -m examples.portable.scripts.export --model_name="add"
 ```
 
-See [Additional Information](#6-additional-information) for the full runner CLI,
+See [Additional Information](#7-additional-information) for the full runner CLI,
 `xt-run` options, and the ExecuTorch install variants.
 
-> **NOTE - Rebuilds.** After the first successful build, recompile C++ changes
-> directly without repeating Stages 3-4:
+> **NOTE - Rebuilds.** After the first successful build, recompile C++ changes directly without repeating Stages 3-4:
 >
-> ```bash
 > cmake --build cmake-out --target install --config Release -j8
-> ```
 >
-> Re-run Stage 3 only when Python dependencies or the host ExecuTorch build
-> change.
+> Repeat Stage 3 and 4 only when Python dependencies or the host ExecuTorch build changes.
 
 ---
 
 ## 5. Exporting Models to `.pte`
 
-The Cadence AOT flow quantizes a PyTorch `nn.Module`, lowers it through the
-Cadence-specific passes, and serializes it to a `.pte` (and a `.bpte` bundled
-program with reference IO). The entry points live in
-[`backends/cadence/aot/export_example.py`](aot/export_example.py):
+The Cadence AOT (Ahead of Time) flow quantizes a PyTorch `nn.Module`, lowers it through the Cadence-specific passes, and serializes it to a `.pte` (and a `.bpte` bundled program with reference IO). The entry points are located in [`backends/cadence/aot/export_example.py`](aot/export_example.py).
 
-*   **`export_model(model, example_inputs, ...)`** - runs the full export
+*   **`export_model(model, example_inputs, ...)`** - Runs the full export
     pipeline (prepare -> calibrate -> convert -> quantize -> lower) and writes the
     `.pte` / `.bpte`. Returns the `ExecutorchProgramManager`.
-*   **`export_and_run_model(model, example_inputs, ...)`** - calls `export_model`,
+*   **`export_and_run_model(model, example_inputs, ...)`** - Calls `export_model`,
     and (only when `verify=True`) runs the exported `.pte` through a host GCC
     build of the runner to verify the program is not corrupted. This does **not**
-    use `xt-run` or the Xtensa ISS — it is a host-side sanity check only.
-    Enabling `verify` also overwrites the default `cmake-out` build directory.
+    use `xt-run` or the Xtensa ISS as it is a host-side sanity check only.
+    Setting `verify` also overwrites the default `cmake-out` build directory.
     Keep `verify=False` (the default) unless you explicitly need this check.
 
-### 5.1 Example models
+### 5.1 Example Models
 
-Ready-to-run examples live under
-[`examples/cadence/models/`](../../examples/cadence/models/) - refer to them as
-templates for exporting your own model:
+Ready-to-run examples are located under [`examples/cadence/models/`](../../examples/cadence/models/) directory. Refer to these examples as templates for exporting your own model.
 
-*   `babyllama.py` - a small Llama transformer
-*   `mobilenet_v2.py`, `resnet50.py` - torchvision CNNs
-*   `vision_transformer.py` - ViT
-*   `wav2vec2.py` - speech model
+*   `babyllama.py` - A small Llama transformer
+*   `mobilenet_v2.py`, `resnet50.py` - Torchvision CNNs
+*   `wav2vec2.py` - Speech model
 *   `rnnt_encoder.py`, `rnnt_predictor.py`, `rnnt_joiner.py` - RNN-T components
 
-Each script builds a model plus `example_inputs` and calls one of the export
-entry points. Run one with:
+Each script builds a model with `example_inputs` and calls one of the export
+entry points. Run one model with:
 
 ```bash
 python3 -m examples.cadence.models.mobilenet_v2
@@ -328,15 +314,15 @@ python3 -m examples.cadence.models.mobilenet_v2
 | `model` | *(required)* | The `nn.Module` to export (set to `eval()` for inference models). |
 | `example_inputs` | *(required)* | Tuple of example input tensors defining the input shapes/dtypes. |
 | `file_name` | `"CadenceDemoModel"` | Base name for the output `.pte` / `.bpte`. |
-| `verify` | `False` | When `True`, run the exported `.pte` through a host GCC build of the runner to verify the program is not corrupted (host-side check only — does **not** use `xt-run` or the Xtensa ISS). Also overwrites the default `cmake-out` directory. **Recommended to keep disabled.** |
+| `verify` | `False` | When `True`, run the exported `.pte` through a host GCC build of the runner to verify the program is not corrupted (host-side check only, it does **not** use `xt-run` or the Xtensa ISS). Also overwrites the default `cmake-out` directory. **Recommended to keep off.** |
 | `eps_error` / `eps_warn` | `1e-1` / `1e-5` | Error/warning thresholds used only when `verify=True`. |
 | `force_rebuild` | `False` | Force the runtime rebuild during verification. |
 | `working_dir` | `None` | Directory for output `.pte` / `.bpte` files. If `None`, a fresh temporary directory under `/tmp` is created automatically. |
 
 `export_model` accepts the same export-related parameters (`file_name`,
-`working_dir`) but does no execution.
+`working_dir`) but does not run the model.
 
-### 5.3 Locating the exported file
+### 5.3 Locating the Exported File
 
 Both export entry points log the output path when the program is written, for
 example:
@@ -353,13 +339,41 @@ it on the ISS with the runner from Stage 7. Pass `working_dir=<path>` (or a
 
 ---
 
-## 6. Additional Information
+## 6. Verification of Models
 
-Reference material for the build above: runner and Xtensa ISS details, the
-ExecuTorch install variants, the Cadence-internal CMake flags, and optional
-build features.
+The primary validation metric is on-device accuracy. The quantized model is exported as a BundledIO program (`.bpte`) that contains the x86 quantized PyTorch reference inputs and outputs. When you run the `.bpte` file on the DSP simulator, the simulator reports two error metrics:
 
-### 6.1 Runner and Xtensa ISS details
+*   Absolute error (mean and maximum)
+*   Relative error (mean and maximum)
+
+These metrics compare DSP execution results directly with the embedded reference outputs.
+
+To use this validation method, set BundledIO during the build (see [Section 7.4](#74-optional-build-features)). This setting generates a `.bpte` file in addition to the `.pte` file. Run the model by using the following command:
+
+```bash
+xt-run --model_path=model.bpte
+```
+
+By default, the primary metric's validation thresholds for both absolute and relative error are set to `0.01`. These values were determined empirically to detect kernel implementation issues, such as fixed-point mismatches, while allowing natural INT8 rounding differences across platforms. Review these thresholds for your use cases and adjust them as needed by using the following options:
+
+*   `--bundle_atol` for the absolute error threshold
+*   `--bundle_rtol` for the relative error threshold
+
+You can also validate DSP output against the output of the original unquantized PyTorch model. In this comparison, both quantization error and DSP optimization error contribute to the overall difference. Thus, the threshold is higher than the primary metric.
+
+To perform this validation:
+
+1.  Export the tensors from the PyTorch model inputs and outputs as float32 `.bin` files.
+2.  Run the simulator with the same input data by using the `--inputs` and `--dump-output` options.
+3.  Compare the simulator output with the PyTorch reference output on an element-by-element basis.
+
+---
+
+## 7. Additional Information
+
+This section provides reference information for the build process, including runner and Xtensa ISS details, ExecuTorch installation options, Cadence internal CMake flags, and optional build features.
+
+### 7.1 Runner and Xtensa ISS Details
 
 The build produces `cadence_executor_runner_sim`
 (`cmake-out/backends/cadence/cadence_executor_runner_sim`), a self-contained
@@ -368,8 +382,7 @@ runner compiled from
 `.pte` (or `.bpte`), runs the first method, and prints/dumps IO. It has **no
 gflags and no threadpool dependency** and uses a plain `argv` parser.
 
-**Runner CLI flags** - parsed by the runner itself, independent of how you launch
-it. Value flags use `--flag=value`; boolean flags are bare.
+**Runner CLI flags** - The runner parses these flags independent of the launch method. Use the `--flag=value` for value options. Specify Boolean options without a value.
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
@@ -382,23 +395,24 @@ it. Value flags use `--flag=value`; boolean flags are bare.
 | `--bundle_rtol=<float>` | `0.01` | *(BundledIO builds only)* Relative tolerance for output verification. |
 | `--bundle_atol=<float>` | `0.01` | *(BundledIO builds only)* Absolute tolerance for output verification. |
 
-Notes:
+Note:
 
 *   **Random input fill** covers `float` (uniform in `[-1, 1]`), `int32`/`int64`
     (small non-negative values, safe for token IDs/indices), `int8`, and `bool`.
     Other dtypes are left unmodified - supply them with `--inputs` instead.
-*   **BundledIO (`.bpte`)** is auto-detected at runtime *if* the runner was built
-    with `-DEXECUTORCH_BUILD_CADENCE_BUNDLE_IO=ON` (Section 6.4). In that mode the
+*   **BundledIO (`.bpte`)** is auto-detected at runtime if the runner was built
+    with `-DEXECUTORCH_BUILD_CADENCE_BUNDLE_IO=ON` ([Section 7.4](#74-optional-build-features)). In that mode the
     runner ignores `--inputs`, loads the embedded reference inputs, runs, prints
     error stats (mean/max abs & relative error), and verifies outputs against the
-    embedded references using `--bundle_rtol` / `--bundle_atol`. On mismatch it
+    embedded references using `--bundle_rtol` / `--bundle_atol`. On mismatch, it
     logs `Test_result: FAIL` and exits non-zero (usable as a CI gate).
 *   The runner reports execution cost as `Execute cycles = <n>` (from `times()`),
-    and its memory pools are fixed at compile time (two 4 MB arenas plus
+    and its memory pools are fixed at compile time (two 4 MB arenas and
     dynamically sized planned buffers).
 
-**Launching with `xt-run`.** `xt-run` executes the cross-compiled ELF on the
-instruction-set simulator and provides **semi-hosting**, so the runner's file I/O
+#### Launching with `xt-run`
+`xt-run` performs the cross-compiled ELF on the
+instruction-set simulator and provides semi-hosting, so the runner's file I/O
 (`--model_path`, `--inputs`, `--dump-*`) transparently reaches the host
 filesystem. Everything after the ELF path is passed straight through to the
 runner.
@@ -436,27 +450,24 @@ xt-run --turbo cmake-out/backends/cadence/cadence_executor_runner_sim \
     --model_path=model.bpte --bundle_rtol=1e-3 --bundle_atol=1e-3
 ```
 
-> **Rule of thumb.** Use `--turbo` while iterating on correctness; drop `--turbo`
+> **Important:** Use `--turbo` while iterating on correctness; drop `--turbo`
 > and add `--mem_model` when you need trustworthy cycle counts.
 
-### 6.2 The ExecuTorch install subset
+### 7.2 The ExecuTorch Install Subset
 
 Stage 3 installs the **host / AOT** ExecuTorch package. The Cadence build does
-not use a full install - it passes a trimmed-down subset via `CMAKE_ARGS`. The
+not use a full install, but it passes a trimmed-down subset through `CMAKE_ARGS`. The
 three variants below explain the trade-offs.
 
-#### Normal (full) install
+#### Normal (full) Install
 
 ```bash
 ./install_executorch.sh
 ```
 
-Installs the full wheel: all example dependencies, every default backend/kernel
-that the top-level preset enables, plus AOT tooling. Heaviest option;
-appropriate for general ExecuTorch development but **more than the Cadence
-backend needs**.
+Installs the full wheel, including all examples dependencies, default backends and kernels, and AOT tooling. This option is intended for general ExecuTorch development and install **more components than the Cadence backend requires.**
 
-#### Minimal install (`--minimal` / `-m`)
+#### Minimal Install (`--minimal` / `-m`)
 
 ```bash
 ./install_executorch.sh --minimal
@@ -464,23 +475,18 @@ backend needs**.
 
 `--minimal` skips the extra packages that are only needed to run the example
 scripts (`install_executorch.py` only calls
-`install_optional_example_requirements()` when `--minimal` is *not* set). The
+`install_optional_example_requirements()` when `--minimal` is not set). The
 resulting wheel ships a slimmer runtime dependency set (the AOT-export subset:
 `flatbuffers`, `numpy`, `packaging`, `pyyaml`, `ruamel.yaml`, `sympy`,
 `tabulate`, `typing-extensions`).
 
-A separate build-time knob, `EXECUTORCH_BUILD_MINIMAL=ON`, disables every
+A separate build-time knob, `EXECUTORCH_BUILD_MINIMAL=ON`, clears every
 optional CMake target (`_minimal_cmake_flags()` in `setup.py`). It targets the
 AOT-export-only wheel and is distinct from the Cadence subset below.
 
-#### Cadence custom subset (the default for this backend)
+#### Cadence Custom Subset (the default for this backend)
 
-The Cadence build does **not** pass `--minimal`. Instead it feeds the curated
-`CMAKE_ARGS` list from
-[Stage 3](#stage-3--install-the-host--aot-executorch-package) to a normal
-`./install_executorch.sh`. This keeps the example/dev dependencies but explicitly
-disables the host-side backends and kernels the DSP flow will never use. Each
-flag and its rationale:
+The Cadence build does **not** use `--minimal` option. Instead, it passes the curated `CMAKE_ARGS` configuration from [Stage 3](#stage-3---install-the-host-executorch-package) to normal `./install_executorch.sh`.This configuration retains the example and development dependencies while clearing the host-side backends and kernels that are not used in DSP flow. The following table explains each flag and the reason for clearing it.
 
 | Flag (`OFF`)                              | Why it is disabled for Cadence |
 | ----------------------------------------- | ------------------------------ |
@@ -498,15 +504,11 @@ flag and its rationale:
 | `EXECUTORCH_BUILD_PYBIND`                 | Python bindings not needed for the AOT export used here. |
 | `EXECUTORCH_BUILD_CMSIS_NN_PYBINDS`       | Cortex-M CMSIS-NN bindings; unrelated backend. |
 
-Net effect: a faster, lighter host install that still contains everything needed
-to **export a `.pte`** and produce the ExecuTorch CMake package that the
-cross-compile step links against.
+This configuration reduces installation time and provides a faster host installation while retaining everything required to **export a `.pte`** and generate ExecuTorch CMake package used by cross-compilation build.
 
-You can extend this subset. To also produce the host Python bindings, for
-example, drop `-DEXECUTORCH_BUILD_PYBIND=OFF` from the list (or set it to `ON`)
-before running the install.
+You can customize this configuration as needed. For example, to build the host Python bindings, remove `-DEXECUTORCH_BUILD_PYBIND=OFF` from the configuration or set it to `ON` before running the installation script.
 
-### 6.3 Cadence-internal CMake flags
+### 7.3 Cadence-internal CMake Flags
 
 These flags are specific to the Cadence backend and are defined in
 [`backends/cadence/CMakeLists.txt`](CMakeLists.txt).
@@ -526,20 +528,20 @@ exclusive with the HiFi path and not set by the HiFi flow:
 **`EXECUTORCH_BUILD_CADENCE_BUNDLE_IO`** - compiles BundledIO (`.bpte`) support
 into `cadence_executor_runner_sim` (defines `ET_BUNDLE_IO_ENABLED` and links
 `bundled_program`). **Requires** `-DEXECUTORCH_BUILD_DEVTOOLS=ON` - CMake
-hard-errors otherwise. See [optional build features](#64-optional-build-features).
+hard-errors otherwise. See [optional build features](#74-optional-build-features).
 
 **`EXECUTORCH_BUILD_CADENCE_OP_TESTS`** - builds the op-level gtest suite
 (cross-compiled for the Xtensa ISS) when the selected backend ships an
 `operators/tests/CMakeLists.txt`.
 
-### 6.4 Optional build features
+### 7.4 Optional Build Features
 
 Two optional features add extra CMake options to the Stage 5 cross-compile.
 Append them to the `cmake` command directly, or use the convenience flags on
 `build_cadence_hifi.sh`.
 
 **BundledIO (`.bpte`)** - enables output verification against embedded reference
-IO in the runner (see the BundledIO note in Section 6.1). Adds:
+IO in the runner (see the BundledIO note in Section 7.1). Adds the following:
 
 ```
 -DEXECUTORCH_BUILD_CADENCE_BUNDLE_IO=ON
@@ -558,7 +560,8 @@ Script equivalent: `./backends/cadence/build_cadence_hifi.sh --tests`.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
+A few common troubleshooting examples are
 
 *   **Missing files or submodule corruption:** force Git to pull clean submodule
     states:
@@ -591,11 +594,50 @@ Script equivalent: `./backends/cadence/build_cadence_hifi.sh --tests`.
 
 ---
 
-## 8. Reference Script
+## 9. Reference Script
 
 [`build_cadence_hifi.sh`](build_cadence_hifi.sh) wires Stages 2-7 together into a
 single script. It is provided as a **reference example** of one working
-configuration - it encodes specific choices (a fixed install subset, `-j8`, an
+configuration, as it encodes specific choices (a fixed install subset, `-j8`, an
 `add.pte` smoke test) that will not fit every setup. Prefer the manual stages
 above and treat this script as a starting point to copy and adapt, not a
 drop-in build for all environments.
+
+---
+
+## Copyright Information
+
+Copyright Â© 2026 Cadence Design Systems, Inc. Cadence Design Systems, Inc. (Cadence), 2655 Seely Ave., San Jose, CA 95134, USA.
+
+### Trademarks
+
+Trademarks and service marks of Cadence Design Systems, Inc. (Cadence) contained in this document are attributed to Cadence with the appropriate symbol. For queries regarding Cadence's trademarks, contact the corporate legal department at the address shown above or call 1-800-862-4522. All other trademarks are the property of their respective holders.
+
+### Restricted Permission
+
+This publication is protected by copyright law and international treaties and contains trade secrets and proprietary information owned by Cadence. Unauthorized reproduction or distribution of this publication, or any portion of it, may result in civil and criminal penalties. Except as expressly permitted below, this publication may not be copied, reproduced, modified, published, uploaded, posted, transmitted, or distributed in any way, including automated processes, training or services involving a large language model, foundation model, deep machine learning, generative artificial intelligence, or any other similar process or technology, without prior written permission from Cadence. 
+
+Unless otherwise agreed to by Cadence in writing, customers are granted permission to print one (1) hard copy of this publication, subject to the following conditions:
+
+- The publication may be used solely for personal, informational, and noncommercial purposes.
+- The publication may not be modified in any way.
+- Any copy of the publication or portion thereof must include all original copyright, trademark, and other proprietary notices and this permission statement.
+- The information contained in this document cannot be used in the development of like products or software, whether for internal or external use, and shall not be used for the benefit of any other party, whether or not for consideration.
+- Cadence reserves the right to revoke this authorization at any time, and any such use shall be discontinued immediately upon written notice from Cadence.
+
+### Disclaimer
+
+Information in this publication is subject to change without notice and does not represent a commitment on the part of Cadence. The information contained herein is the proprietary and confidential information of Cadence or its licensors, and is supplied subject to, and may be used only by Cadence's customer in accordance with, a written agreement between Cadence and its customer. Except as may be explicitly set forth in such agreement, Cadence does not make, and expressly disclaims, any representations or warranties as to the completeness, accuracy or usefulness of the information contained in this document. Cadence does not warrant that use of such information will not infringe any third party rights, nor does Cadence assume any liability for damages or costs of any kind that may result from use of such information.
+
+### Restricted Rights
+
+Use, duplication, or disclosure by the Government is subject to restrictions as set forth in FAR52.227-14 and DFAR252.227-7013 et seq. or its successor.
+
+### Support
+
+For further assistance, contact Cadence ASK at [https://support.cadence.com/](https://support.cadence.com/).
+
+
+Product Release: ExecuTorch HiFi Early Access
+Last Updated: 08/2026
+Version: 1.0
