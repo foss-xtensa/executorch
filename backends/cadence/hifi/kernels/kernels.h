@@ -120,6 +120,17 @@ extern "C" WORD32 xa_nn_reduce_mean_4D_f32_f32(
     WORD32 num_axis_dims,
     void* __restrict__ p_scratch_in);
 
+extern "C" WORD32 xa_nn_layer_norm_f32(
+    FLOAT32* __restrict__ p_out,
+    FLOAT32* __restrict__ p_mean,
+    FLOAT32* __restrict__ p_rstd,
+    const FLOAT32* __restrict__ p_inp,
+    const FLOAT32* __restrict__ p_weight,
+    const FLOAT32* __restrict__ p_bias,
+    WORD32 M,
+    WORD32 N,
+    FLOAT32 eps);
+    
 namespace impl {
 namespace HiFi {
 namespace kernels {

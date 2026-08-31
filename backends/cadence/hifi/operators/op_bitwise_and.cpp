@@ -54,7 +54,7 @@ Tensor& bitwise_and_Tensor_out(
   ET_KERNEL_CHECK(ctx, canCast(common_type, out_type), InvalidArgument, out);
 
   static constexpr const char op_name[] = "bitwise_and.Tensor_out";
-  constexpr int kNnlibMaxDim = 16;
+  constexpr int kNnlibMaxDim = 8;
   int a_dim = a.dim(), b_dim = b.dim(), out_dim = out.dim();
   bool optimized = true;
 
@@ -65,6 +65,9 @@ Tensor& bitwise_and_Tensor_out(
   max_dim = out.dim() > max_dim ? out.dim() : max_dim;
 
   if (out_type != ScalarType::Bool)
+    optimized = false;
+
+  if ((a_dim == 0) || (b_dim == 0))
     optimized = false;
 
   if (max_dim > kNnlibMaxDim)
