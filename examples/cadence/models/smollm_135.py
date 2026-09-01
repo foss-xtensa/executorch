@@ -1,0 +1,52 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Example script for exporting simple models to flatbuffer
+
+import logging
+
+import torch
+from executorch.backends.cadence.aot.export_example import export_model
+from executorch.backends.cadence.aot.ops_registrations import *  # noqa
+from transformers import AutoConfig, AutoModelForCausalLM
+
+FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=FORMAT)
+
+
+class SmolLMWrapper(torch.nn.Module):
+    def __init__(self, hf_model):
+        super().__init__()
+        self.transformer = hf_model.model
+        self.lm_head = hf_model.lm_head
+
+    def forward(self, input_ids):
+        # Index 0 contains raw hidden states; bypasses HF dict return to prevent graph breaks
+        hidden_states = self.transformer(input_ids)[0]
+        return self.lm_head(hidden_states)
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    # Path to weights; loads locally if present, otherwise downloads automatically from Hugging Face
+    model_name_or_path = "examples/cadence/models/smollm135"
+
+    config = AutoConfig.from_pretrained(model_name_or_path)
+    config.return_dict = False
+    config.use_cache = False
+
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        config=config,
+        torch_dtype=torch.float32,
+    )
+
+    model = SmolLMWrapper(hf_model).eval()
+
+    # Input sequence (Batch=1, SeqLen=32)
+    example_inputs = (torch.randint(0, config.vocab_size, (1, 32), dtype=torch.long),)
+
+    export_model(model, example_inputs)
