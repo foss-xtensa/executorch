@@ -56,7 +56,9 @@ def main() -> None:
     np.array(padded, dtype=np.int64).tofile(args.out)
 
     logging.info("Prompt: %r", args.prompt)
-    logging.info("Token ids (%d real, padded to %d): %s", prompt_len, args.seq_len, padded)
+    logging.info(
+        "Token ids (%d real, padded to %d): %s", prompt_len, args.seq_len, padded
+    )
     logging.info("Wrote %s (last real token at index %d).", args.out, prompt_len - 1)
     logging.info(
         "Run with: --inputs=%s and note --prompt_len=%d for decoding.",

@@ -61,7 +61,10 @@ def main() -> None:
     for token_id in top_ids:
         token_str = tokenizer.decode([token_id])
         logging.info(
-            "  id=%d logit=%.3f token=%r", token_id, next_token_logits[token_id], token_str
+            "  id=%d logit=%.3f token=%r",
+            token_id,
+            next_token_logits[token_id],
+            token_str,
         )
 
     predicted_id = int(top_ids[0])

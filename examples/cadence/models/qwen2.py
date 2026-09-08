@@ -1,12 +1,5 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-# Example script for exporting simple models to flatbuffer
-
 import logging
+import os
 
 import torch
 from examples.cadence.export_test import export_and_test_model
@@ -17,7 +10,7 @@ FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 
 
-class SmolLMWrapper(torch.nn.Module):
+class Qwen2Wrapper(torch.nn.Module):
     def __init__(self, hf_model):
         super().__init__()
         self.transformer = hf_model.model
@@ -31,11 +24,11 @@ class SmolLMWrapper(torch.nn.Module):
 
 if __name__ == "__main__":
     # Path to weights; loads locally if present, otherwise downloads automatically from Hugging Face
-    path_to_weights = "examples/cadence/models/smollm135"
+    path_to_weights = (
+        "examples/cadence/models/qwen2"
+    )
     model_name_or_path = (
-        path_to_weights
-        if os.path.exists(path_to_weights)
-        else "HuggingFaceTB/SmolLM-135M"
+        path_to_weights if os.path.exists(path_to_weights) else "Qwen/Qwen2-0.5B"
     )
 
     config = AutoConfig.from_pretrained(model_name_or_path)
@@ -48,7 +41,7 @@ if __name__ == "__main__":
         torch_dtype=torch.float32,
     )
 
-    model = SmolLMWrapper(hf_model).eval()
+    model = Qwen2Wrapper(hf_model).eval()
 
     # Input sequence (Batch=1, SeqLen=32)
     example_inputs = (torch.randint(0, config.vocab_size, (1, 32), dtype=torch.long),)

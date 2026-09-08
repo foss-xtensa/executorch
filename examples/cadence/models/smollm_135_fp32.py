@@ -76,7 +76,5 @@ if __name__ == "__main__":
         torch_dtype=torch.float32,
     )
     model = SmolLMWrapper(hf_model).eval()
-    example_inputs = (
-        torch.randint(0, config.vocab_size, (1, 32), dtype=torch.long),
-    )
+    example_inputs = (torch.randint(0, config.vocab_size, (1, 32), dtype=torch.long),)
     export_model_fp32(model, example_inputs)

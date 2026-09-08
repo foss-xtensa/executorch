@@ -69,7 +69,7 @@ Tensor& atan2_out(
   ScalarType compute_type = get_compute_type(common_type);
 
   static constexpr const char op_name[] = "atan2.out";
-  constexpr int kNnlibMaxDim = 16;
+  constexpr int kNnlibMaxDim = 8;
   int a_dim = a.dim(), b_dim = b.dim(), out_dim = out.dim();
   bool optimized = true;
 
@@ -80,6 +80,9 @@ Tensor& atan2_out(
   max_dim = out.dim() > max_dim ? out.dim() : max_dim;
 
   if (out_type != ScalarType::Float)
+    optimized = false;
+
+  if ((a_dim == 0) || (b_dim == 0))
     optimized = false;
 
   if (max_dim > kNnlibMaxDim)
@@ -110,22 +113,39 @@ Tensor& atan2_out(
       WORD32 p_inp1_shape[kNnlibMaxDim];
       WORD32 p_inp2_shape[kNnlibMaxDim];
 
-      for (int i = 0; i < out_dim; i++)
+      for (int i = 0; i < out_dim; i++) {
         p_out_shape[i] = out.size(i);
+        p_inp1_shape[i] = 1;
+        p_inp2_shape[i] = 1;
+      }
+
+      int off_a = out_dim - a_dim;
+      int off_b = out_dim - b_dim;
+
       for (int i = 0; i < a_dim; i++)
-        p_inp1_shape[i] = a.size(i);
+        p_inp1_shape[i + off_a] = a.size(i);
       for (int i = 0; i < b_dim; i++)
-        p_inp2_shape[i] = b.size(i);
+        p_inp2_shape[i + off_b] = b.size(i);
 
-      WORD32 ret_val =
-          xa_nn_broadcast_32_32(ptr1, p_out_shape, pin1, p_inp1_shape, out_dim);
+      XT_KERNEL_CHECK(
+          ctx,
+          out,
+          xa_nn_broadcast_32_32,
+          ptr1,
+          p_out_shape,
+          pin1,
+          p_inp1_shape,
+          out_dim);
 
-      ET_KERNEL_CHECK(ctx, ret_val == 0, Internal, out);
-
-      ret_val =
-          xa_nn_broadcast_32_32(ptr2, p_out_shape, pin2, p_inp2_shape, out_dim);
-
-      ET_KERNEL_CHECK(ctx, ret_val == 0, Internal, out);
+      XT_KERNEL_CHECK(
+          ctx,
+          out,
+          xa_nn_broadcast_32_32,
+          ptr2,
+          p_out_shape,
+          pin2,
+          p_inp2_shape,
+          out_dim);
 
       FLOAT32* __restrict__ p_out =
           (FLOAT32* __restrict__)out.mutable_data_ptr<float>();
@@ -147,15 +167,24 @@ Tensor& atan2_out(
       WORD32 p_out_shape[kNnlibMaxDim];
       WORD32 p_inp1_shape[kNnlibMaxDim];
 
-      for (int i = 0; i < out_dim; i++)
+      for (int i = 0; i < out_dim; i++) {
         p_out_shape[i] = out.size(i);
+        p_inp1_shape[i] = 1;
+      }
+
+      int off_a = out_dim - a_dim;
       for (int i = 0; i < a_dim; i++)
-        p_inp1_shape[i] = a.size(i);
+        p_inp1_shape[i + off_a] = a.size(i);
 
-      WORD32 ret_val = xa_nn_broadcast_32_32(
-          (WORD32*)ptr1, p_out_shape, (WORD32*)pin1, p_inp1_shape, out_dim);
-
-      ET_KERNEL_CHECK(ctx, ret_val == 0, Internal, out);
+      XT_KERNEL_CHECK(
+          ctx,
+          out,
+          xa_nn_broadcast_32_32,
+          (WORD32*)ptr1,
+          p_out_shape,
+          (WORD32*)pin1,
+          p_inp1_shape,
+          out_dim);
 
       FLOAT32* __restrict__ p_out =
           (FLOAT32* __restrict__)out.mutable_data_ptr<float>();
@@ -178,10 +207,14 @@ Tensor& atan2_out(
       WORD32 p_out_shape[kNnlibMaxDim];
       WORD32 p_inp1_shape[kNnlibMaxDim];
 
-      for (int i = 0; i < out_dim; i++)
+      for (int i = 0; i < out_dim; i++) {
         p_out_shape[i] = out.size(i);
+        p_inp1_shape[i] = 1;
+      }
+
+      int off_b = out_dim - b_dim;
       for (int i = 0; i < b_dim; i++)
-        p_inp1_shape[i] = b.size(i);
+        p_inp1_shape[i + off_b] = b.size(i);
 
       XT_KERNEL_CHECK(
           ctx,
