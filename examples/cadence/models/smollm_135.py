@@ -7,6 +7,7 @@
 # Example script for exporting simple models to flatbuffer
 
 import logging
+import os
 
 import torch
 from examples.cadence.export_test import export_and_test_model

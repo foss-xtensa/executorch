@@ -12,7 +12,7 @@ from executorch.backends.cadence.aot.ops_registrations import *  # noqa
 
 import torch
 
-from executorch.backends.cadence.aot.export_example import export_and_run_model
+from examples.cadence.export_test import export_and_test_model
 
 from executorch.examples.models.llama.llama_transformer import (
     construct_transformer,
@@ -37,7 +37,7 @@ def main() -> None:
     model = construct_transformer(args)
     example_inputs = (torch.randint(0, 10, [b, seq], dtype=torch.int64),)
 
-    export_and_run_model(model, example_inputs)
+    export_and_test_model(model, example_inputs)
 
 
 if __name__ == "__main__":

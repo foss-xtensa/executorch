@@ -10,7 +10,7 @@ import logging
 from typing import List, Optional, Tuple
 
 import torch
-from executorch.backends.cadence.aot.export_example import export_and_run_model
+from examples.cadence.export_test import export_and_test_model
 from executorch.backends.cadence.aot.ops_registrations import *  # noqa
 from torchaudio.models import Emformer
 
@@ -150,4 +150,4 @@ if __name__ == "__main__":
         transcriber_lengths,
     )
 
-    export_and_run_model(encoder, example_inputs)
+    export_and_test_model(encoder, example_inputs)
