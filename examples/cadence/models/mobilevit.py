@@ -22,7 +22,7 @@ class MobileViTWrapper(torch.nn.Module):
 
 if __name__ == "__main__":
     # Path to weights; loads locally if present, otherwise downloads automatically from Hugging Face
-    path_to_weights = "/fac/proj_audiopune/dsp3-jenkins/locspace3/Jobs/Executorch_CDNS/weights/mobilevit"
+    path_to_weights = "examples/cadence/models/weights/mobilevit"
     model_name_or_path = (
         path_to_weights
         if os.path.exists(path_to_weights)

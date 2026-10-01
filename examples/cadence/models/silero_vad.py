@@ -121,7 +121,7 @@ def load_model(jit_path: str) -> SileroVAD16k:
 
 if __name__ == "__main__":
     # Path to weights; loads locally if present, otherwise downloads automatically
-    path_to_weights = "/fac/proj_audiopune/dsp3-jenkins/locspace3/Jobs/Executorch_CDNS/weights/silero_vad.jit"
+    path_to_weights = "examples/cadence/models/weights/silero_vad.jit"
     if not os.path.exists(path_to_weights):
         os.makedirs(os.path.dirname(path_to_weights), exist_ok=True)
         torch.hub.download_url_to_file(

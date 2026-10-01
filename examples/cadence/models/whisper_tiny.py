@@ -26,7 +26,7 @@ class WhisperWrapper(torch.nn.Module):
 
 if __name__ == "__main__":
     # Path to weights; loads locally if present, otherwise downloads automatically from Hugging Face
-    path_to_weights = "/home/vsaksham/Weights/whisper_tiny"
+    path_to_weights = "examples/cadence/models/weights/whisper_tiny"
     model_name_or_path = (
         path_to_weights if os.path.exists(path_to_weights) else "openai/whisper-tiny"
     )
