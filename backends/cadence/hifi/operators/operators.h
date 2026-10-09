@@ -226,6 +226,21 @@ void im2row_per_tensor_out(
     int64_t dim1,
     ::executorch::aten::Tensor& out);
 
+std::tuple<
+    ::executorch::aten::Tensor&,
+    ::executorch::aten::Tensor&,
+    ::executorch::aten::Tensor&>
+native_layer_norm_out(
+    ::executorch::runtime::KernelRuntimeContext& ctx,
+    const ::executorch::aten::Tensor& input,
+    ::executorch::aten::IntArrayRef normalized_shape,
+    const std::optional<::executorch::aten::Tensor>& weight,
+    const std::optional<::executorch::aten::Tensor>& bias,
+    double eps,
+    ::executorch::aten::Tensor& out,
+    ::executorch::aten::Tensor& mean_out,
+    ::executorch::aten::Tensor& rstd_out);
+
 } // namespace native
 } // namespace HiFi
 } // namespace impl

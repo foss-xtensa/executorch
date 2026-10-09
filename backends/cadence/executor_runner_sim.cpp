@@ -20,6 +20,7 @@
  */
 
 #include <sys/times.h>
+#include <xtensa/sim.h>
 
 #include <cinttypes>
 #include <cstdio>
@@ -608,10 +609,13 @@ int main(int argc, char** argv) {
 
   ET_LOG(Info, "Starting model execution...");
 
+  xt_iss_client_command("all", "disable");
+  xt_iss_client_command("all", "enable");
   struct tms t_start, t_stop;
   times(&t_start);
   const Error exec_status = method->execute();
   times(&t_stop);
+  xt_iss_client_command("all", "disable");
   ET_LOG(
       Info,
       "Execute cycles = %ld",
