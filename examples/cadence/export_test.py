@@ -1,8 +1,6 @@
-# ============================================================================
-# DO NOT COMMIT
 # ----------------------------------------------------------------------------
-# This file is strictly for local testing, experiments, and debugging.
-# DO NOT include in git commits, pull requests, or forward to anyone.
+# Custom export_model to enable verification of quantization.
+# Compare F32 model to Quantized model.
 # ============================================================================
 
 # pyre-unsafe

@@ -286,6 +286,10 @@ The Cadence AOT (Ahead of Time) flow quantizes a PyTorch `nn.Module`, lowers it 
   use `xt-run` or the Xtensa ISS as it is a host-side sanity check only.
   Setting `verify` also overwrites the default `cmake-out` build directory.
   Keep `verify=False` (the default) unless you explicitly need this check.
+* **`export_and_test_model(model, example_inputs, ...)`** - A local testing
+  helper in [`examples/cadence/export_test.py`](examples/cadence/export_test.py)
+  that runs native FP32 and quantized reference inference, reports quantization
+  loss, and exports the model to `.pte` / `.bpte`.
 
 ### 6.1 Example Models
 
