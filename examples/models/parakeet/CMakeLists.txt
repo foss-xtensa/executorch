@@ -7,7 +7,9 @@
 cmake_minimum_required(VERSION 3.24)
 project(parakeet_runner)
 
-set(CMAKE_CXX_STANDARD 17)
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(EXECUTORCH_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
@@ -149,9 +151,11 @@ if(MSVC AND EXECUTORCH_BUILD_CUDA)
       TARGET ${parakeet_target}
       POST_BUILD
       COMMAND
-        ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:aoti_cuda_shims>
+        ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_RUNTIME_DLLS:${parakeet_target}>
         $<TARGET_FILE_DIR:${parakeet_target}>
-      COMMENT "Copying aoti_cuda_shims.dll to ${parakeet_target} directory"
+      COMMENT "Copying runtime DLLs to ${parakeet_target} directory"
+      COMMAND_EXPAND_LISTS
     )
   endforeach()
 endif()

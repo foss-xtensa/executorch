@@ -9,6 +9,9 @@ from executorch.backends.transforms.utils import (
     delete_constant_placeholder,
 )
 from executorch.exir import to_edge
+from executorch.exir.backend.canonical_partitioners.duplicate_constant_node_pass import (
+    duplicate_constant_node,
+)
 from executorch.exir.dialects._ops import ops as exir_ops
 from torch.export import export
 from torch.export.graph_signature import InputKind
@@ -104,6 +107,134 @@ def _test_create_delete(kind: InputKind, persistent_buffer: bool = None):
     assert len(exported_program.graph_signature.input_specs) == 1
     assert len(exported_program.state_dict) == 0
     assert len(exported_program.constants) == 0
+
+
+def test_create_delete_sanitized_name():
+    """
+    torch.fx renames a placeholder whose requested name is not a valid
+    identifier, e.g. '0_weight_fused_bn' from a top-level nn.Sequential.
+    Target, graph signature and state_dict must follow the assigned name.
+    """
+    module = EmptyNetwork()
+    exported_program = export(module, args=module.test_data, strict=True)
+    exported_program = to_edge(exported_program).exported_program()
+    graph = exported_program.graph_module.graph
+
+    input_node = list(graph.nodes)[0]
+    with graph.inserting_before(input_node):
+        const_node = create_constant_placeholder(
+            exp_program=exported_program,
+            graph=graph,
+            kind=InputKind.PARAMETER,
+            name="0_test_node",
+            data=torch.ones(1),
+        )
+
+    assert const_node.name != "0_test_node"
+    assert const_node.name.isidentifier()
+    assert const_node.target == const_node.name
+    assert const_node.name in exported_program.graph_signature.inputs_to_parameters
+    target = exported_program.graph_signature.inputs_to_parameters[const_node.name]
+    assert target in exported_program.state_dict
+
+    with graph.inserting_after(input_node):
+        add_node = graph.create_node(
+            "call_function",
+            exir_ops.edge.aten.add.Tensor,
+            args=(input_node, const_node),
+            kwargs={},
+        )
+    output_node = graph.output_node()
+    output_node.replace_input_with(input_node, add_node)
+
+    # Recompiling emits the placeholder target as a function parameter name
+    assert exported_program.module()(torch.zeros(1)) == 1
+
+    output_node.replace_input_with(add_node, input_node)
+    graph.eliminate_dead_code()
+    delete_constant_placeholder(exported_program, const_node)
+    assert len(exported_program.state_dict) == 0
+    assert len(exported_program.graph_signature.input_specs) == 1
+
+
+def test_create_same_name_returns_existing_node():
+    """
+    Requesting the same name twice must return the existing node instead of
+    creating a duplicate, including when torch.fx renamed the placeholder.
+    """
+    # "block1-0_weight" mirrors torchvision regnet's hyphenated module names
+    for requested_name in ("test_node", "0_test_node", "block1-0_weight"):
+        module = EmptyNetwork()
+        exported_program = export(module, args=module.test_data, strict=True)
+        exported_program = to_edge(exported_program).exported_program()
+        graph = exported_program.graph_module.graph
+
+        input_node = list(graph.nodes)[0]
+        with graph.inserting_before(input_node):
+            first = create_constant_placeholder(
+                exp_program=exported_program,
+                graph=graph,
+                kind=InputKind.PARAMETER,
+                name=requested_name,
+                data=torch.ones(1),
+            )
+        with graph.inserting_before(input_node):
+            second = create_constant_placeholder(
+                exp_program=exported_program,
+                graph=graph,
+                kind=InputKind.PARAMETER,
+                name=requested_name,
+                data=torch.ones(1),
+            )
+
+        assert first is second
+        placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+        assert len(placeholders) == 2  # the created node and the user input
+        assert len(exported_program.state_dict) == 1
+
+
+def test_delete_placeholders_sharing_target():
+    """
+    duplicate_constant_node gives every copy the target of the original, so the
+    tensor must stay until the last placeholder referring to it is deleted.
+    """
+
+    class SharedWeight(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, x):
+            return x + self.weight, x - self.weight
+
+    exported_program = to_edge(
+        export(SharedWeight(), (torch.zeros(1),), strict=True)
+    ).exported_program()
+    (weight_name,) = exported_program.graph_signature.inputs_to_parameters
+    weight = next(n for n in exported_program.graph.nodes if n.name == weight_name)
+    # A copy is made for a user in another delegate.
+    for i, user in enumerate(weight.users):
+        user.meta["delegation_tag"] = f"tag{i}"
+    duplicate_constant_node(exported_program, weight_name)
+
+    weight_nodes = [
+        node
+        for node in exported_program.graph.nodes
+        if node.name in exported_program.graph_signature.inputs_to_parameters
+    ]
+    assert len(weight_nodes) == 2
+    input_node = next(
+        node
+        for node in exported_program.graph.nodes
+        if node.name in exported_program.graph_signature.user_inputs
+    )
+    for node in weight_nodes:
+        node.replace_all_uses_with(input_node)
+
+    delete_constant_placeholder(exported_program, weight_nodes[0])
+    assert "weight" in exported_program.state_dict
+    delete_constant_placeholder(exported_program, weight_nodes[1])
+    assert len(exported_program.state_dict) == 0
 
 
 def test_create_delete_parameter():

@@ -386,6 +386,61 @@ class TestCoreMLPartitioner(unittest.TestCase):
         self.assertIn("executorch_call_delegate", op_names)
         self.assertNotIn("aten.randn.default", op_names)
 
+    def test_ops_above_rank_5_are_skipped(self):
+        """
+        Core ML tensors have at most rank 5.  coremltools only rewrites an
+        unbranched view, permute, view chain through a higher rank (a window
+        partition), and raises on any other op above rank 5.  The partitioner
+        must leave those ops to the portable backend and keep such a layout
+        chain delegated.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                windows = x.view(2, 2, 2, 2, 2, 8).permute(0, 1, 3, 2, 4, 5)
+                windows = windows.reshape(-1, 4, 8).relu()
+                branched = x.view(2, 2, 2, 2, 2, 8).permute(0, 1, 3, 2, 4, 5)
+                branched = (
+                    branched.reshape(-1, 4, 8).sum() + branched.reshape(32, 8).sum()
+                )
+                stacked = torch.stack([x.unsqueeze(0), x.unsqueeze(0) * 2])
+                return windows.sum() + branched + stacked.sum(0).relu().sum()
+
+        model = Model().eval()
+        x = torch.randn(2, 4, 4, 8)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("executorch_call_delegate", op_names)
+        self.assertIn("aten.sum.dim_IntList", op_names)
+        self.assertEqual(op_names.count("aten.permute_copy.default"), 1)
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(edge.to_executorch().buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=5e-2, rtol=5e-2))
+
+        # A skipped permute leaves the chain's views with no rank 6 rewrite.
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep,
+            partitioner=[
+                CoreMLPartitioner(
+                    skip_ops_for_coreml_delegation=["aten.permute_copy.default"]
+                )
+            ],
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertEqual(op_names.count("aten.permute_copy.default"), 2)
+
     def test_argmax_argmin_dim_none_is_skipped(self):
         """
         Regression test for https://github.com/pytorch/executorch/issues/11715.
@@ -432,6 +487,79 @@ class TestCoreMLPartitioner(unittest.TestCase):
         ]
         self.assertIn("executorch_call_delegate", op_names)
         self.assertNotIn("aten.argmax.default", op_names)
+
+    def test_bfloat16_ops_are_skipped(self):
+        """
+        coremltools has no bfloat16 type and raises on ops that use it.  The
+        partitioner must leave those ops to the portable backend and still
+        delegate the rest, also when the same op has a float32 call that Core
+        ML takes (as under bfloat16 autocast).
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, q):
+                a = torch.nn.functional.scaled_dot_product_attention(q, q, q)
+                b = q.to(torch.bfloat16)
+                c = torch.nn.functional.scaled_dot_product_attention(b, b, b)
+                return a + c.float()
+
+        model = Model().eval()
+        x = torch.randn(1, 2, 4, 8)
+        ep = torch.export.export(model, (x,), strict=True)
+        edge = executorch.exir.to_edge_transform_and_lower(
+            ep, partitioner=[CoreMLPartitioner()]
+        )
+        op_names = [
+            n.target.__name__
+            for n in edge.exported_program().graph.nodes
+            if n.op == "call_function"
+        ]
+        self.assertIn("executorch_call_delegate", op_names)
+        self.assertNotIn("aten.scaled_dot_product_attention.default", op_names)
+        if _TEST_RUNTIME:
+            program = Runtime.get().load_program(edge.to_executorch().buffer)
+            out = program.load_method("forward").execute((x,))[0]
+            self.assertTrue(torch.allclose(out, model(x), atol=5e-2, rtol=5e-2))
+
+    def test_tied_embedding_is_quantized_with_its_linear(self):
+        """A weight that is both an embedding table and an output projection lowers.
+
+        The quantizer config opts gathers out so that embedding tables are not compressed
+        by it. When the table is tied to a linear's weight, that opt-out leaves one
+        constant with two configurations, which coremltools rejects — so the opt-out has
+        to stop at the tie rather than fail the whole lowering.
+        """
+
+        class Tied(torch.nn.Module):
+            def __init__(self, vocab=512, dim=64, tie=True):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(vocab, dim)
+                self.output = torch.nn.Linear(dim, vocab, bias=False)
+                if tie:
+                    self.output.weight = self.embedding.weight
+
+            def forward(self, ids):
+                return self.output(self.embedding(ids))
+
+        ids = torch.zeros(1, 4, dtype=torch.long)
+        for tie in (True, False):
+            compile_specs = CoreMLBackend.generate_compile_specs(
+                minimum_deployment_target=ct.target.iOS18,
+                compute_precision=ct.precision(ct.precision.FLOAT16.value),
+                op_linear_quantizer_config={
+                    "mode": "linear_symmetric",
+                    "dtype": "int4",
+                    "granularity": "per_channel",
+                },
+            )
+            exported = torch.export.export(Tied(tie=tie).eval(), (ids,), strict=True)
+            delegated = executorch.exir.to_edge_transform_and_lower(
+                exported,
+                partitioner=[CoreMLPartitioner(compile_specs=compile_specs)],
+            )
+            # Reaching a program at all is the assertion: the failure this covers is
+            # raised during lowering, not carried in the result.
+            self.assertIsNotNone(delegated.to_executorch())
 
     def test_deprecation_warning_for_to_backend_workflow(self):
         """
@@ -532,5 +660,6 @@ if __name__ == "__main__":
     test_runner.test_take_over_constant_data_false()
     test_runner.test_aten_rand_default_falls_back_to_portable()
     test_runner.test_aten_randn_is_still_delegated()
+    test_runner.test_tied_embedding_is_quantized_with_its_linear()
     test_runner.test_deprecation_warning_for_to_backend_workflow()
     test_runner.test_no_warning_for_to_edge_transform_and_lower_workflow()

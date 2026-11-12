@@ -34,6 +34,9 @@ class MockCudaAllocator : public DeviceAllocator {
     // malloc returns memory aligned to alignof(max_align_t), which satisfies
     // kDefaultAlignment; the mock only exercises the default alignment.
     (void)alignment;
+    if (fail_allocations_) {
+      return Error::MemoryAllocationFailed;
+    }
     void* ptr = std::malloc(nbytes);
     if (!ptr) {
       return Error::MemoryAllocationFailed;
@@ -84,6 +87,12 @@ class MockCudaAllocator : public DeviceAllocator {
     return etensor::DeviceType::CUDA;
   }
 
+  Error synchronize(etensor::DeviceIndex index) override {
+    synced_h2d_count_ = h2d_count_;
+    last_sync_index_ = index;
+    return Error::Ok;
+  }
+
   /**
    * Returns true if ptr falls within the most recent allocation range.
    * Useful for verifying that tensor data_ptrs point to device memory.
@@ -98,6 +107,7 @@ class MockCudaAllocator : public DeviceAllocator {
   }
 
   void reset() {
+    fail_allocations_ = false;
     allocate_count_ = 0;
     deallocate_count_ = 0;
     h2d_count_ = 0;
@@ -111,11 +121,17 @@ class MockCudaAllocator : public DeviceAllocator {
     last_h2d_src_ = nullptr;
     last_h2d_size_ = 0;
     last_h2d_index_ = -1;
+    synced_h2d_count_ = 0;
+    last_sync_index_ = -1;
     last_d2h_dst_ = nullptr;
     last_d2h_src_ = nullptr;
     last_d2h_size_ = 0;
     last_d2h_index_ = -1;
   }
+
+  /// When set, allocate() reports MemoryAllocationFailed without allocating,
+  /// so callers can be tested against a device that is out of memory.
+  bool fail_allocations_ = false;
 
   // Allocation tracking
   int allocate_count_ = 0;
@@ -132,6 +148,9 @@ class MockCudaAllocator : public DeviceAllocator {
   const void* last_h2d_src_ = nullptr;
   size_t last_h2d_size_ = 0;
   etensor::DeviceIndex last_h2d_index_ = -1;
+  /// The value of h2d_count_ when synchronize() last ran.
+  int synced_h2d_count_ = 0;
+  etensor::DeviceIndex last_sync_index_ = -1;
 
   // Device-to-host copy tracking
   int d2h_count_ = 0;

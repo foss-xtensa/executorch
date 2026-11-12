@@ -6,29 +6,69 @@
 
 
 import contextlib
+import copy
+import functools
 import logging
+import math
 import os
 import shutil
+import sys
 import threading
 import typing
+import weakref
 from importlib import resources
 from typing import Any, Dict, final, List, Optional
 
 import torch
+
+# Registers torch_attn._varlen_attn, which the decomposition table names.
+import torch.nn.attention.varlen  # noqa: F401
 from executorch.backends.aoti.aoti_backend import AotiBackend
+from executorch.backends.cuda.autotune.cuda_graph_timing import cuda_graph_timing
+from executorch.backends.cuda.autotune.inputs import autotune_input_scenarios
+from executorch.backends.cuda.autotune.launch_params import autotune_launch_params
+from executorch.backends.cuda.cuda_weight_collector import (
+    AOTI_DEVICE_TYPE_CPU,
+    AOTI_DEVICE_TYPE_CUDA,
+    CudaWeightCollector,
+    trim_host_memory,
+)
+from executorch.backends.cuda.passes.lower_offgraph_kv import (
+    CheckOffGraphKVStepWidthPass,
+    LowerOffGraphKVPass,
+    OFFGRAPH_KV_COMPILE_SPEC,
+    OFFGRAPH_KV_STEP_WIDTH_COMPILE_SPEC,
+    parse_offgraph_kv_manifest,
+)
 from executorch.backends.cuda.passes.move_cond_predicate_to_cpu import (
     MoveCondPredicateToCpuPass,
+)
+from executorch.backends.cuda.passes.remove_assert_async import RemoveAssertAsyncPass
+from executorch.backends.cuda.passes.replace_complex_with_real import (
+    ReplaceComplexWithRealPass,
+)
+from executorch.backends.cuda.passes.replace_fused_sdpa import (
+    ReplaceFusedSdpaWithSdpaPass,
 )
 from executorch.backends.cuda.passes.replace_int64_floordiv import (
     ReplaceInt64FloorDivWithFloatPass,
 )
+from executorch.backends.cuda.passes.replace_masked_copy_with_where import (
+    ReplaceMaskedCopyWithWherePass,
+)
+from executorch.backends.cuda.target_smem import target_smem_context
+from executorch.backends.cuda.triton.kernels import triton_mutation_cache
 from executorch.backends.cuda.triton.replacement_pass import (
     ReplaceEdgeOpWithTritonOpPass,
 )
+from executorch.exir._serialize._cord import FileBackedData
 from executorch.exir._warnings import experimental
-from executorch.exir.backend.backend_details import BackendDetails
+from executorch.exir.backend.backend_details import BackendDetails, PreprocessResult
 from executorch.exir.backend.compile_spec_schema import CompileSpec
+from torch._decomp import decomposition_table
 from torch._inductor.decomposition import conv1d_to_conv2d
+from torch._prims_common import suggest_memory_format
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.nn.attention import SDPBackend
 
 # ---------------------------------------------------------------------------
@@ -60,6 +100,209 @@ def _is_cpu_clone_active() -> bool:
     return getattr(_CPU_CLONE_GUARD, "active", False)
 
 
+def _aoti_device_type_for_weight(tensor: torch.Tensor) -> int:
+    # Low-memory compilation clones lifted CUDA buffers onto CPU, while the
+    # patched wrapper records them as CUDA constants. Mirror that target-device
+    # substitution in the metadata. Outside that scoped mode the serialized
+    # tensor's actual device is the AOTI constant's device.
+    if _is_cpu_clone_active() or tensor.device.type == "cuda":
+        return AOTI_DEVICE_TYPE_CUDA
+    if tensor.device.type == "cpu":
+        return AOTI_DEVICE_TYPE_CPU
+    raise RuntimeError(
+        f"Unsupported AOTI constant device for CUDA export: {tensor.device}"
+    )
+
+
+@contextlib.contextmanager
+def _keep_triton_reduction_loads_loop_scoped():
+    """Conservatively treating loads as reduction-masked keeps each definition in its
+    own loop to bypass the undefined variable bug in pytorch/pytorch.
+    (https://github.com/pytorch/pytorch/issues/193988)
+
+    TODO(gasoonjia): remove this setting once bug fixed in upstream
+    """
+    from torch._inductor.codegen.triton import IndexingOptions
+
+    orig_has_rmask = IndexingOptions.has_rmask
+
+    def _has_rmask(_self) -> bool:
+        return True
+
+    IndexingOptions.has_rmask = _has_rmask
+    try:
+        yield
+    finally:
+        IndexingOptions.has_rmask = orig_has_rmask
+
+
+class _Depth(threading.local):
+    def __init__(self) -> None:
+        self.value = 0
+
+
+class _CompilePatch:
+    """A patch of Inductor that changes behavior only for the threads inside
+    ``scope()``.
+
+    ``install`` applies the patch and returns the function that removes it.
+    The patched code calls the ``active`` function it is given to decide, on
+    each call, whether the calling thread asked for the change. Threads can
+    lower at the same time, so the first scope to enter installs the patch
+    and the last one to leave removes it: a thread that leaves first does not
+    take the patch away from one still compiling.
+    """
+
+    def __init__(self, install: typing.Callable[..., typing.Callable[[], None]]):
+        self._install = install
+        self._remove: typing.Callable[[], None] = lambda: None
+        self._lock = threading.Lock()
+        self._scopes = 0
+        self._depth = _Depth()
+
+    def _active(self) -> bool:
+        return self._depth.value > 0
+
+    @contextlib.contextmanager
+    def scope(self) -> typing.Iterator[None]:
+        with self._lock:
+            if self._scopes == 0:
+                self._remove = self._install(self._active)
+            self._scopes += 1
+        self._depth.value += 1
+        try:
+            yield
+        finally:
+            self._depth.value -= 1
+            with self._lock:
+                self._scopes -= 1
+                if self._scopes == 0:
+                    self._remove()
+
+
+def _install_small_gpu_override(active):
+    from torch._inductor import utils as inductor_utils
+
+    original = inductor_utils.is_big_gpu
+
+    def is_big_gpu(index_or_device=0) -> bool:
+        return active() or original(index_or_device)
+
+    inductor_utils.is_big_gpu = is_big_gpu
+
+    def remove() -> None:
+        inductor_utils.is_big_gpu = original
+
+    return remove
+
+
+_SMALL_GPU_OVERRIDE = _CompilePatch(_install_small_gpu_override)
+
+
+def _allow_triton_templates_on_small_gpus() -> typing.ContextManager[None]:
+    """Let Inductor use Triton templates on GPUs below its 68-SM floor. This
+    backend autotunes with Triton only, so otherwise a matmul or convolution
+    has no Triton choices left.
+
+    Only threads inside this context get the override; other threads get the
+    original answer.
+
+    TODO: remove once Inductor skips the floor when ATen is not an allowed
+    backend (https://github.com/pytorch/pytorch/issues/141690).
+    """
+    return _SMALL_GPU_OVERRIDE.scope()
+
+
+def _install_as_needed_links(active):
+    from torch._inductor import cpp_builder
+
+    original = cpp_builder.get_cpp_torch_device_options
+
+    def device_options(device_type, aot_mode=False, *args, **kwargs):
+        definitions, include_dirs, cflags, ldflags, *rest = original(
+            device_type, aot_mode, *args, **kwargs
+        )
+        if (
+            aot_mode
+            and active()
+            and sys.platform.startswith("linux")
+            and not torch._inductor.config.aot_inductor.link_libtorch
+            and torch._inductor.config.aot_inductor.cross_target_platform is None
+        ):
+            ldflags = [*ldflags, "Wl,--as-needed"]
+        return (definitions, include_dirs, cflags, ldflags, *rest)
+
+    cpp_builder.get_cpp_torch_device_options = device_options
+
+    def remove() -> None:
+        cpp_builder.get_cpp_torch_device_options = original
+
+    return remove
+
+
+_AS_NEEDED_LINKS = _CompilePatch(_install_as_needed_links)
+
+
+def _link_libraries_as_needed() -> typing.ContextManager[None]:
+    """Record only the shared libraries the compiled program calls into.
+
+    Inductor puts OpenMP on every Linux link. Unless the compiler asks the
+    linker to link as needed, as Ubuntu's GCC does by default, the linker
+    records libgomp even when nothing in the program calls OpenMP. Torch ships
+    a libgomp, which hides this whenever torch is loaded, but a process without
+    torch then fails to load the program on a machine with no system libgomp.
+    ``--as-needed`` drops only libraries nothing references, so a program that
+    does call OpenMP keeps it. Links with libtorch are left alone: a library
+    there can be needed without being referenced, because its static
+    initializers register something.
+
+    Only threads inside this context get the flag.
+
+    TODO: remove once the pinned PyTorch has the same flag in Inductor
+    (https://github.com/pytorch/pytorch/pull/202902).
+    """
+    return _AS_NEEDED_LINKS.scope()
+
+
+def _install_float_kernel_args(active):
+    from torch._inductor.codegen.cpp_wrapper_gpu import (
+        DeferredTritonCallWrapper,
+        TRITON_SIGNATURE_TO_CPP,
+    )
+
+    original = DeferredTritonCallWrapper._get_cpp_param_type
+
+    def get_cpp_param_type(self, name, arg_type, signature=None):
+        param = original(self, name, arg_type, signature)
+        # PyTorch 2.14 does not pass the signature on every path.
+        kind = (signature or (self.triton_meta or {}).get("signature", {})).get(name)
+        if active() and param == f"int64_t {name}" and kind in ("fp32", "fp64"):
+            return f"{TRITON_SIGNATURE_TO_CPP[kind]} {name}"
+        return param
+
+    DeferredTritonCallWrapper._get_cpp_param_type = get_cpp_param_type
+
+    def remove() -> None:
+        DeferredTritonCallWrapper._get_cpp_param_type = original
+
+    return remove
+
+
+_FLOAT_KERNEL_ARGS = _CompilePatch(_install_float_kernel_args)
+
+
+def _pass_float_scalars_to_triton_as_floats() -> typing.ContextManager[None]:
+    """Declare a float that a Triton kernel takes, such as a value read with
+    ``.item()``, as a float in the C++ function that launches the kernel.
+    AOTInductor declares every such argument int64_t, so 1.5 reaches the
+    kernel as 1.
+
+    TODO: remove once the pinned PyTorch takes the type from the kernel's
+    signature (https://github.com/pytorch/pytorch/pull/201882).
+    """
+    return _FLOAT_KERNEL_ARGS.scope()
+
+
 def _full_zeros_preserving_strides(x: torch.Tensor, device) -> torch.Tensor:
     """Allocate a zero-filled tensor matching ``x``'s size/stride/dtype on ``device``.
 
@@ -82,18 +325,93 @@ def _is_emptied(x) -> bool:
     )
 
 
+def _tensor_properties_for_low_memory(tensor, original):
+    if _is_cpu_clone_active() and _is_emptied(tensor):
+        return None
+    return original(tensor)
+
+
+def _required_storage_nbytes(x: torch.Tensor) -> int:
+    """Return the backing storage required by ``x``'s logical view."""
+    if x.numel() == 0:
+        return 0
+    last_element = x.storage_offset()
+    for size, stride in zip(x.size(), x.stride()):
+        last_element += (size - 1) * stride
+    return int(last_element + 1) * x.element_size()
+
+
 @contextlib.contextmanager
-def _compile_time_cpu_clones(target_device: torch.device):
+def _rehydrate_emptied_tensors(tensors):
+    """Temporarily restore zero storage while preserving tensor aliases.
+
+    Low-memory CUDA export keeps KV tensors' sizes and strides but releases
+    their backing storage. Inductor autotuning needs those original tensor
+    objects throughout cloning, reset-to-zero, and kernel launch. Restoring the
+    shared storages in place preserves views/aliases that replacing individual
+    arguments with fresh tensors would break.
+    """
+    emptied = [tensor for tensor in tensors if _is_emptied(tensor)]
+    storages = {}
+    for tensor in emptied:
+        storage = tensor.untyped_storage()
+        key = storage._cdata
+        required = _required_storage_nbytes(tensor)
+        if key not in storages or required > storages[key][1]:
+            storages[key] = (storage, required)
+
+    restored = []
+    try:
+        for storage, required in storages.values():
+            storage.resize_(required)
+            restored.append(storage)
+        for tensor in emptied:
+            tensor.zero_()
+        yield
+    finally:
+        # The autotuner finishes with reset_to_zero_args(), whose CUDA zero_
+        # launches asynchronously.  Releasing the storage before that work has
+        # completed leaves the kernel writing through a freed pointer; the
+        # resulting illegal access is then reported by some later CUDA API
+        # (often preserve_rng_state's set_rng_state).  All users of storage that
+        # is about to be resized away must be complete first.
+        cuda_devices = {tensor.device for tensor in emptied if tensor.is_cuda}
+        for device in cuda_devices:
+            torch.cuda.synchronize(device)
+        for storage in reversed(restored):
+            storage.resize_(0)
+
+
+@contextlib.contextmanager
+def _compile_time_cpu_clones(target_device: torch.device):  # noqa: C901
     """Force AOTI's mutated-buffer clones onto CPU while preserving the
     serialized constants' target device."""
-    from torch._inductor import compile_fx as _cfx, graph as _graph
+    from torch._inductor import (
+        codecache as _codecache,
+        compile_fx as _cfx,
+        graph as _graph,
+    )
     from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu as _Cpp
     from torch._inductor.graph import GraphLowering as _GL
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner as _Autotuner
 
     orig_clone = _cfx.clone_preserve_strides
     orig_codegen_device = _Cpp.codegen_device
     orig_get_const = _GL.get_original_value_of_constant
     orig_is_same = _graph.is_same_tensor
+    orig_tensor_properties = _codecache.TensorProperties
+    orig_determine_aoti_mmap_flags = _codecache.determine_aoti_mmap_flags
+
+    def _force_external_weights_for_fqn_binding(consts_size):
+        # Structured weights are serialized as independently named storages,
+        # but the generated AOTI wrapper must still use the external-weights
+        # ABI. That mode preserves the original constant view metadata when
+        # the runtime replaces the dense blob with user-managed FQN tensors.
+        if _is_cpu_clone_active():
+            return True, False
+        return orig_determine_aoti_mmap_flags(consts_size)
+
+    orig_autotuner_run = _Autotuner.run
 
     def _is_same_skip_emptied(data, value):
         # KV buffers freed via resize_(0) all have data_ptr 0, so the stock
@@ -111,8 +429,6 @@ def _compile_time_cpu_clones(target_device: torch.device):
         # `triton_heuristics.py` (clones for benchmark — must stay on GPU for
         # Triton). Discriminate by caller frame so we only force CPU clones for
         # the buffer-lifting path.
-        import sys
-
         caller = sys._getframe(1).f_code.co_name
         if caller == "_unlift_graph":
             # KV-cache buffers are emptied (storage resize_(0)) by the low-memory
@@ -123,6 +439,20 @@ def _compile_time_cpu_clones(target_device: torch.device):
                 return _full_zeros_preserving_strides(x, "cpu")
             return orig_clone(x).cpu()
         return orig_clone(x)
+
+    def _autotuner_run_with_rehydrated_emptied_args(self, *args, **kwargs):
+        # CachingAutotuner.run first benchmarks configurations (where cloning and
+        # reset_to_zero_args touch the inputs), then launches the winning kernel
+        # once more on the original arguments. Keep their storage valid through
+        # both phases and the final launch; wrapping benchmark_all_configs alone
+        # would release it too early for that last call.
+        tensors = (
+            value
+            for value in (*args, *kwargs.values())
+            if isinstance(value, torch.Tensor)
+        )
+        with _rehydrate_emptied_tensors(tensors):
+            return orig_autotuner_run(self, *args, **kwargs)
 
     def _get_const_synthesize_zeros(self, name):
         # AOTI serializes each constant via get_original_value_of_constant ->
@@ -152,6 +482,11 @@ def _compile_time_cpu_clones(target_device: torch.device):
     _Cpp.codegen_device = _codegen_device_target_aware
     _GL.get_original_value_of_constant = _get_const_synthesize_zeros
     _graph.is_same_tensor = _is_same_skip_emptied
+    _codecache.TensorProperties = functools.partial(
+        _tensor_properties_for_low_memory, original=orig_tensor_properties
+    )
+    _codecache.determine_aoti_mmap_flags = _force_external_weights_for_fqn_binding
+    _Autotuner.run = _autotuner_run_with_rehydrated_emptied_args
     prev_active = getattr(_CPU_CLONE_GUARD, "active", False)
     _CPU_CLONE_GUARD.active = True
     try:
@@ -162,6 +497,9 @@ def _compile_time_cpu_clones(target_device: torch.device):
         _Cpp.codegen_device = orig_codegen_device
         _GL.get_original_value_of_constant = orig_get_const
         _graph.is_same_tensor = orig_is_same
+        _codecache.TensorProperties = orig_tensor_properties
+        _codecache.determine_aoti_mmap_flags = orig_determine_aoti_mmap_flags
+        _Autotuner.run = orig_autotuner_run
 
 
 def _is_kv_buffer(name, v) -> bool:
@@ -261,6 +599,317 @@ def _move_to_device_resize_kv(ep, location):
     _move_graph_nodes_to_device(ep.graph_module, location)
     ep.validate()
     return ep
+
+
+def _on_off_compile_spec_value(spec: CompileSpec) -> bool:
+    value = spec.value.decode("utf-8").upper()
+    if value not in ["ON", "OFF"]:
+        raise ValueError(f"Invalid {spec.key}: {value}. Expected 'ON' or 'OFF'.")
+    return value == "ON"
+
+
+CUDA_GRAPH_AUTOTUNE_TIMING_COMPILE_SPEC = "cuda_graph_autotune_timing"
+
+# The CUDA tensors `move_program_to_device` placed on the GPU for the compile on
+# this thread: they can be parked on the CPU when an autotune capture runs out
+# of memory, since AOTI autotunes on random inputs rather than on them. Held
+# weakly, so they live exactly as long as the program (or a decomposed copy
+# sharing them) does.
+_MOVED_TENSORS = threading.local()
+
+
+def _track_moved_tensors(program) -> None:
+    tensors = list(getattr(program, "state_dict", {}).values())
+    tensors += list(getattr(program, "constants", {}).values())
+    _MOVED_TENSORS.refs = [
+        weakref.ref(t) for t in tensors if isinstance(t, torch.Tensor) and t.is_cuda
+    ]
+
+
+def _moved_program_tensors() -> List[torch.Tensor]:
+    live = (ref() for ref in getattr(_MOVED_TENSORS, "refs", ()))
+    return [t for t in live if t is not None]
+
+
+def _conv_transpose_as_conv(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride=1,
+    padding=0,
+    output_padding=0,
+    groups: int = 1,
+    dilation=1,
+) -> torch.Tensor:
+    """
+    Rewrite a 1-D or 2-D transposed convolution as a stride 1 convolution with
+    the flipped kernel, over the input with stride - 1 zeros inserted between
+    elements and padded on each side. Inductor has no Triton template for
+    transposed convolution on CUDA, so it would call ATen's convolution, which
+    this backend does not ship.
+    """
+    n = weight.dim() - 2
+    if input.dim() == n + 1:
+        return _conv_transpose_as_conv(
+            input.unsqueeze(0),
+            weight,
+            bias,
+            stride,
+            padding,
+            output_padding,
+            groups,
+            dilation,
+        ).squeeze(0)
+    options = []
+    for v in (stride, padding, output_padding, dilation):
+        v = [v] if isinstance(v, int) else list(v)
+        options.append(v * n if len(v) == 1 else v)
+    stride, padding, output_padding, dilation = options
+    x = input
+    pad = []
+    crops = []
+    for i, dim in enumerate(range(2, 2 + n)):
+        if stride[i] > 1:
+            length = x.shape[dim]
+            zeros = x.new_zeros(*x.shape[: dim + 1], stride[i] - 1, *x.shape[dim + 1 :])
+            x = torch.cat([x.unsqueeze(dim + 1), zeros], dim + 1).flatten(dim, dim + 1)
+            x = x.narrow(dim, 0, (length - 1) * stride[i] + 1)
+        before = dilation[i] * (weight.shape[dim] - 1) - padding[i]
+        after = before + output_padding[i]
+        # constant_pad_nd takes the last dimension first. Negative padding is
+        # applied as a crop after padding, since cropping first can need more
+        # elements than the input has.
+        pad = [max(before, 0), max(after, 0)] + pad
+        if before < 0 or after < 0:
+            crops.append((dim, max(-before, 0), x.shape[dim] + before + after))
+    if any(pad):
+        x = torch.ops.aten.constant_pad_nd.default(x, pad)
+    for dim, start, length in crops:
+        x = x.narrow(dim, start, length)
+    # (in, out / groups, *kernel) -> (out, in / groups, *kernel)
+    weight = (
+        weight.unflatten(0, (groups, -1))
+        .transpose(1, 2)
+        .flatten(0, 1)
+        .flip(list(range(2, 2 + n)))
+    )
+    conv = conv1d_to_conv2d if n == 1 else torch.ops.aten.conv2d.default
+    return conv(x, weight, bias, [1] * n, [0] * n, dilation, groups)
+
+
+def _reshape_copy(x: torch.Tensor, size: List[int]) -> torch.Tensor:
+    """
+    Torch-TensorRT turns a view into _reshape_copy, and a view that TensorRT
+    leaves to PyTorch reaches this backend in that form. Inductor has no
+    lowering for it and this backend no kernel. ATen computes it as a
+    contiguous copy viewed to the new shape.
+    """
+    return x.clone(memory_format=torch.contiguous_format).view(size)
+
+
+def _varlen_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: Optional[torch.Tensor],
+    max_q: int,
+    max_k: int,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+    window_size: Optional[List[int]] = None,
+    enable_gqa: bool = False,
+    seqused_k: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    num_splits: Optional[int] = None,
+    backend: Optional[int] = None,
+) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    varlen_attn runs Flash or cuDNN attention, and this backend has a kernel
+    for neither. Attend over all the packed tokens instead, with a mask that
+    keeps each query in its own sequence. This holds a float32 score per head
+    for every pair of packed tokens, 1 GiB for 16 heads and 4096 tokens. As in
+    Flash attention, a causal mask or a window lines up the ends of each query
+    and key sequence, and a query with no key to attend to gets zeros and an
+    infinite log-sum-exp. Unlike in Flash attention, a NaN or inf in one
+    sequence's values also reaches the other sequences.
+    """
+    if cu_seq_k is None or seqused_k is not None or block_table is not None:
+        raise NotImplementedError(
+            "The CUDA backend lowers varlen_attn only with cu_seq_k and without "
+            "seqused_k or block_table."
+        )
+    left, right = window_size if window_size is not None else (-1, -1)
+    if is_causal:
+        right = 0
+    # Flash attention 2, PyTorch's default, drops a window side of max_k or
+    # more and gives a left side alone a right side of max_k, while later
+    # versions keep the window. That only matters for a query sequence
+    # longer than max_k + 1.
+    if (right > 0 or (right < 0 and left >= 0)) and not statically_known_true(
+        max_q <= max_k + 1
+    ):
+        raise NotImplementedError(
+            "The CUDA backend lowers a varlen_attn window other than (left, 0) "
+            "only when max_q <= max_k + 1 is known, since Flash attention "
+            "versions differ on it for longer query sequences. Got "
+            f"window_size={window_size}, max_q={max_q}, max_k={max_k}."
+        )
+
+    def sequence_ends(cu: torch.Tensor, total: int):
+        # Each token's index in cu of its sequence's end, and its (negative)
+        # distance from that end. Tokens before cu[0] get the index 0, and
+        # tokens past cu[-1] get cu.numel() and, through the clamp, their
+        # distance from cu[-1]. So each group forms one more sequence.
+        token = torch.arange(total, dtype=cu.dtype, device=cu.device)
+        end = torch.searchsorted(cu, token, right=True)
+        return end, token - cu[end.clamp(max=cu.numel() - 1)]
+
+    end_q, from_end_q = sequence_ends(cu_seq_q, query.size(0))
+    end_k, from_end_k = sequence_ends(cu_seq_k, key.size(0))
+    allowed = end_q[:, None] == end_k[None, :]
+    offset = from_end_k[None, :] - from_end_q[:, None]
+    if left >= 0:
+        allowed = allowed & (offset >= -left)
+    if right >= 0:
+        allowed = allowed & (offset <= right)
+    # Masked keys get zero weight, but NaN * 0 is NaN. Zero the values outside
+    # the key sequences so that a NaN or inf there stays out of them.
+    outside = (end_k == 0) | (end_k == cu_seq_k.numel())
+    value = value.masked_fill(outside[:, None, None], 0)
+
+    if enable_gqa:
+        key, value = (
+            t.repeat_interleave(query.size(1) // t.size(1), dim=1) for t in (key, value)
+        )
+    if scale is None:
+        scale = query.size(-1) ** -0.5
+    scores = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~allowed, float("-inf"))
+    lse = scores.logsumexp(-1)
+    empty = lse == float("-inf")
+    # Not exp(scores - lse): at large scores, float32 rounds lse as coarsely
+    # as the scores, and the weights no longer add up to one.
+    probs = scores.softmax(-1).masked_fill(empty[..., None], 0)
+    lse = lse.masked_fill(empty, float("inf"))
+    out = torch.einsum("hqk,khd->qhd", probs, value.float()).to(query.dtype)
+    rng_state = torch.zeros(2, dtype=torch.uint64, device=query.device)
+    # einsum gives a permuted view. The op lays out its output in the
+    # query's dimension order, so a query in the usual (T, H, D) order, even
+    # a slice of a packed tensor, gives a contiguous output. Later views of
+    # it rely on that.
+    return out.contiguous(), lse, rng_state
+
+
+def _linear_kernel(x: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(1 - x.abs(), min=0)
+
+
+def _cubic_kernel(x: torch.Tensor) -> torch.Tensor:
+    # Keys' cubic with a = -0.5, the one ATen's antialiased bicubic uses.
+    a = -0.5
+    x = x.abs()
+    near = ((a + 2) * x - (a + 3)) * x * x + 1
+    far = (((x - 5) * x + 8) * x - 4) * a
+    return torch.where(x < 1, near, torch.where(x < 2, far, torch.zeros_like(x)))
+
+
+def _antialias_taps(
+    in_size: int,
+    out_size: int,
+    align_corners: bool,
+    scale: Optional[float],
+    support: int,
+    kernel: typing.Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+) -> typing.Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Taps of an antialiased resize along one dim, computed as ATen does:
+    output o reads input index[o, k] with weight[o, k], and inside[o, k]
+    marks the taps in its window. The window is the kernel's support widened
+    by the downscale factor, and the weights in it are normalized.
+    """
+    if align_corners or scale is None or scale <= 0:
+        if align_corners:
+            # ATen uses a ratio of 0 for an output size of 1. min and max give
+            # that without a conditional: an exported program keeps the branch
+            # it was traced with, so a plain if would divide by zero there.
+            num = (in_size - 1) * torch.sym_min(out_size - 1, 1)
+            den = torch.sym_max(out_size - 1, 1)
+        else:
+            num, den = in_size, out_size
+        ratio = num / den
+        # The tap count is a shape that both the host and the kernel work out.
+        # In float32 the kernel can round num / den just past a whole number
+        # and count more taps than the host allocated, so use integers.
+        reach = torch.sym_max((support * num + den - 1) // den, support)
+    else:
+        ratio = 1.0 / scale
+        reach = math.ceil(support * max(ratio, 1.0))
+    widen = torch.sym_max(ratio, 1.0)
+    dtype = torch.float32
+    center = ratio * (torch.arange(out_size, dtype=dtype, device=device) + 0.5)
+    first = torch.clamp(torch.trunc(center - support * widen + 0.5), min=0)
+    end = torch.clamp(torch.trunc(center + support * widen + 0.5), max=in_size)
+    taps = 2 * reach + 1
+    tap = torch.arange(taps, dtype=dtype, device=device)
+    position = first[:, None] + tap
+    inside = position < end[:, None]
+    weights = kernel((tap + (first - center)[:, None] + 0.5) * (1.0 / widen))
+    weights = torch.where(inside, weights, 0)
+    total = weights.sum(1, keepdim=True)
+    weights = torch.where(total != 0, weights / total, weights)
+    # Clamp after the cast: in float32, in_size - 1 rounds up to in_size for
+    # very long axes.
+    index = position.to(torch.int64).clamp(max=in_size - 1)
+    return index, weights, inside
+
+
+def _antialiased_resize(
+    support: int,
+    kernel: typing.Callable[[torch.Tensor], torch.Tensor],
+    input: torch.Tensor,
+    output_size: List[int],
+    align_corners: bool,
+    scales_h: Optional[float] = None,
+    scales_w: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Rewrite an antialiased bilinear or bicubic resize as a weighted sum over
+    each output's taps, one dim at a time. Inductor has no lowering for these
+    resizes, so it would call ATen's kernel, which this backend does not ship.
+    """
+    # The rewrite computes in float32, so float64 would lose precision, and
+    # ATen's CUDA kernel has no integer version.
+    if input.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return NotImplemented
+    # Half types are computed in float and rounded once, so they can differ
+    # slightly from ATen, which keeps its weights in the input type.
+    result = input.float()
+    for dim, scale in ((3, scales_w), (2, scales_h)):
+        index, weights, inside = _antialias_taps(
+            input.shape[dim],
+            output_size[dim - 2],
+            align_corners,
+            scale,
+            support,
+            kernel,
+            input.device,
+        )
+        rows, taps = index.shape
+        trailing = [1] * (3 - dim)
+        # Plain indexing lets Inductor fold the gather into the sum instead of
+        # keeping every tap of every row in memory.
+        gathered = result[(slice(None),) * dim + (index,)]
+        # Taps outside the window already have zero weight, but NaN * 0 is NaN,
+        # so mask them out to keep a NaN or inf local.
+        weighted = torch.where(
+            inside.view(rows, taps, *trailing),
+            gathered * weights.view(rows, taps, *trailing),
+            0,
+        )
+        result = weighted.sum(dim + 1)
+    return result.to(input.dtype).contiguous(memory_format=suggest_memory_format(input))
 
 
 @final
@@ -370,34 +1019,233 @@ class CudaBackend(AotiBackend, BackendDetails):
             return False
 
     @classmethod
+    def _should_include_ptx(cls, compile_specs: List[CompileSpec]) -> bool:
+        include_ptx = True
+        for spec in compile_specs:
+            if spec.key == "cuda_include_ptx":
+                include_ptx = _on_off_compile_spec_value(spec)
+        return include_ptx and cls._setup_cuda_environment_for_fatbin()
+
+    @classmethod
     def save_data_externally(cls) -> bool:
         """
-        CUDA backend saves SO blob and weights blob to an external .ptd file.
+        CUDA backend saves weight storages (and, when configured, SO blobs) in
+        external named data such as a .ptd file.
         This file must be provided at runtime via --data_path argument.
         """
         return True
 
     @classmethod
+    def _preprocess_with_weight_collector(
+        cls,
+        edge_program: Any,
+        compile_specs: List[CompileSpec],
+        collector: CudaWeightCollector,
+    ) -> PreprocessResult:
+        with collector.capture(_aoti_device_type_for_weight) as capture:
+            result = super().preprocess(edge_program, compile_specs)
+        if capture.artifact is None:
+            raise RuntimeError("CUDA AOTI did not return a structured Weights output")
+        target_sm = None
+        ptx_compute = 0
+        if torch.version.hip is None:
+            from torch._inductor.codegen.cuda.compile_utils import (
+                _nvcc_arch_as_compile_option,
+            )
+
+            compiled_arch = _nvcc_arch_as_compile_option()
+            target_arch = compiled_arch.removesuffix("a")
+            if not target_arch.isdigit():
+                raise RuntimeError(f"Unsupported CUDA architecture: {compiled_arch}")
+            target_sm = int(target_arch)
+            # Architecture-accelerated PTX targets such as compute_90a and
+            # compute_120a are not forward-compatible fallback images.
+            if cls._should_include_ptx(compile_specs) and compiled_arch.isdigit():
+                ptx_compute = int(compiled_arch)
+        collector.add_preprocess_result(
+            result,
+            capture.artifact,
+            cls.get_device_name(),
+            target_sm=target_sm,
+            ptx_compute=ptx_compute,
+            external_tag=cls.data_name_from_compile_specs(compile_specs),
+        )
+        return result
+
+    @classmethod
+    def preprocess(
+        cls, edge_program: Any, compile_specs: List[CompileSpec]
+    ) -> PreprocessResult:
+        """Compile one CUDA method with its own weight collector."""
+        collector = CudaWeightCollector()
+        result = cls._preprocess_with_weight_collector(
+            edge_program, compile_specs, collector
+        )
+        collector.finish()
+        return result
+
+    @classmethod
+    def preprocess_multimethod(
+        cls,
+        edge_programs: Dict[str, List[Any]],
+        compile_specs: Dict[str, List[List[CompileSpec]]],
+    ) -> Dict[str, List[PreprocessResult]]:
+        """Compile every method against one global ``(device, FQN)`` store."""
+        # The methods share one weights file, so they must agree on its name.
+        data_names = {
+            cls.data_name_from_compile_specs(specs)
+            for method_specs in compile_specs.values()
+            for specs in method_specs
+        }
+        if len(data_names) > 1:
+            raise ValueError(
+                "Every method of a program must use the same data name, got "
+                f"{sorted(data_names)}"
+            )
+        collector = CudaWeightCollector()
+        results: Dict[str, List[PreprocessResult]] = {}
+        for method_name, programs in edge_programs.items():
+            if method_name not in compile_specs:
+                raise ValueError(f"Missing CUDA compile specs for {method_name!r}")
+            method_specs = compile_specs[method_name]
+            if len(programs) != len(method_specs):
+                raise ValueError(
+                    f"Method {method_name!r} has {len(programs)} partitions but "
+                    f"{len(method_specs)} compile-spec lists"
+                )
+            results[method_name] = [
+                cls._preprocess_with_weight_collector(program, specs, collector)
+                for program, specs in zip(programs, method_specs)
+            ]
+        collector.finish()
+        return results
+
+    @classmethod
+    def load_weights_blob(
+        cls, blob_path: str, compile_specs: List[CompileSpec]
+    ) -> tuple[Any, str]:
+        """Keep low-memory CUDA named data file-backed during serialization.
+
+        New FQN artifacts use this path only for AotiBackend's empty
+        compatibility placeholder. Legacy binary-blob handling remains
+        unchanged for callers that still provide a real blob.
+        """
+        if not cls._is_low_memory_mode(compile_specs):
+            return super().load_weights_blob(blob_path, compile_specs)
+        blob_data = FileBackedData.move_from(blob_path)
+        return blob_data, blob_data.sha256().hex()
+
+    @classmethod
+    def materialize_weights_blob(
+        cls, paths: Any, compile_specs: List[CompileSpec]
+    ) -> Any:
+        if not isinstance(paths, list):
+            return paths
+
+        from torch.export.pt2_archive._package_weights import Weights
+
+        weights = [path for path in paths if isinstance(path, Weights)]
+        if not weights:
+            return paths
+        if len(weights) != 1:
+            raise RuntimeError(
+                f"Expected one CUDA AOTI weights output, got {len(weights)}"
+            )
+
+        so_path = next(
+            (
+                path
+                for path in paths
+                if isinstance(path, str) and path.endswith(".wrapper.so")
+            ),
+            None,
+        )
+        if so_path is None:
+            raise RuntimeError(f"Expected a CUDA AOTI .wrapper.so output, got {paths}")
+        blob_path = os.path.splitext(so_path)[0] + "_weights.blob"
+        capture = CudaWeightCollector.current_capture()
+        capture.artifact = capture.collector.materialize(
+            weights[0], os.path.dirname(blob_path), capture.device_type_for_weight
+        )
+
+        # Keep AotiBackend's existing path contract intact. The compatibility
+        # blob is empty and ignored by the versioned CUDA runtime path; old
+        # artifacts continue to carry and load their original dense blob.
+        with open(blob_path, "wb"):
+            pass
+
+        # Replace the structured Weights output with the compatibility path
+        # expected by AotiBackend's existing named-data packaging contract.
+        materialized = [path for path in paths if not isinstance(path, Weights)]
+        if blob_path not in materialized:
+            materialized.append(blob_path)
+        return materialized
+
+    @classmethod
+    def copy_exported_program_for_preprocess(
+        cls, edge_program, compile_specs: List[CompileSpec]
+    ):
+        """Copy graph structure while sharing immutable tensor storage.
+
+        CUDA preprocessing replaces state-dict entries when moving them to the
+        target device; it does not mutate the source tensors.  Memoizing those
+        tensors therefore avoids a model-sized host copy for every delegated
+        method while preserving an independent graph and state-dict mapping.
+        """
+        if not cls._is_low_memory_mode(compile_specs):
+            return copy.deepcopy(edge_program)
+
+        tensor_memo = {
+            id(tensor): tensor
+            for values in (edge_program.state_dict, edge_program.constants)
+            for tensor in values.values()
+            if isinstance(tensor, torch.Tensor)
+        }
+        return copy.deepcopy(edge_program, tensor_memo)
+
+    @classmethod
     def get_supported_fallback_kernels(cls) -> Dict[str, Any]:
+        # ROCm does not build the CUDA-only .cu fallback shims.
+        if torch.version.hip is not None:
+            return {}
         return {
             "at::_ops::_weight_int4pack_mm::call": None,
+            # Also under the shim name Inductor derives for it.
+            "aoti_torch_cuda__weight_int4pack_mm": None,
             "at::_ops::sort_stable::call": None,
+            "aoti_torch_cuda_sort_stable": None,
             "aoti_torch_cuda_randint_low_out": None,
-            "executorch_cuda::int4_plain_mm": None,
-            "aoti_torch_cuda_int4_plain_mm": None,
-            "executorch_cuda::int5_plain_mm": None,
-            "aoti_torch_cuda_int5_plain_mm": None,
-            "executorch_cuda::int6_plain_mm": None,
-            "aoti_torch_cuda_int6_plain_mm": None,
-            "executorch_cuda::int8_plain_mm": None,
-            "aoti_torch_cuda_int8_plain_mm": None,
+            "aoti_torch_cuda_index_Tensor": None,
+            "aoti_torch_index_put_out": None,
+            "aoti_torch_cuda_scatter_reduce_two_out": None,
+            "aoti_torch_cuda_scatter_src_out": None,
         }
 
     @classmethod
     def get_decomposition_table(cls) -> Dict[Any, Any]:
-        return {
+        table = {
             torch.ops.aten.conv1d.default: conv1d_to_conv2d,
+            torch.ops.aten.conv_transpose1d.default: _conv_transpose_as_conv,
+            # torch._check_tensor_all exports to this op; Inductor has no lowering
+            # for it and the shim no fallback kernel.
+            torch.ops.aten._is_all_true.default: torch.ops.aten.all.default,
+            torch.ops.aten._reshape_copy.default: _reshape_copy,
+            torch.ops.torch_attn._varlen_attn.default: _varlen_attn,
         }
+        for resize, support, kernel in (
+            (torch.ops.aten._upsample_bilinear2d_aa, 1, _linear_kernel),
+            (torch.ops.aten._upsample_bicubic2d_aa, 2, _cubic_kernel),
+        ):
+            table[resize.default] = functools.partial(
+                _antialiased_resize, support, kernel
+            )
+            # The vec form works out the output size and calls the default form.
+            table[resize.vec] = decomposition_table[resize.vec]
+        # Inductor disables its transposed conv2d Triton template only on CUDA
+        # (https://github.com/pytorch/pytorch/issues/187081).
+        if torch.version.hip is None:
+            table[torch.ops.aten.conv_transpose2d.input] = _conv_transpose_as_conv
+        return table
 
     @classmethod
     def get_custom_passes(cls, compile_specs: List[CompileSpec]) -> List[typing.Any]:
@@ -405,7 +1253,7 @@ class CudaBackend(AotiBackend, BackendDetails):
         Return CUDA-specific passes: ReplaceEdgeOpWithTritonOpPass.
 
         The Triton kernel replacement behavior can be controlled via compile_specs:
-        - triton_kernel_mode="ON": Always use Triton kernels
+        - triton_kernel_mode="ON": Use Triton kernels for the calls they support; other calls use the regular lowering
         - triton_kernel_mode="OFF": Never use Triton kernels and fallback to other implementations like cuda or decomposed operator.
         """
         # Parse compile_specs for triton_kernel_mode
@@ -419,7 +1267,31 @@ class CudaBackend(AotiBackend, BackendDetails):
                         f"Invalid triton_kernel_mode: {mode}. Expected 'ON' or 'OFF'."
                     )
                 triton_kernel_mode = mode
-        passes = [MoveCondPredicateToCpuPass(), ReplaceInt64FloorDivWithFloatPass()]
+        passes = [
+            RemoveAssertAsyncPass(),
+            ReplaceComplexWithRealPass(),
+            MoveCondPredicateToCpuPass(),
+            ReplaceInt64FloorDivWithFloatPass(),
+            ReplaceFusedSdpaWithSdpaPass(),
+            ReplaceMaskedCopyWithWherePass(),
+        ]
+        cell_layout = any(
+            spec.key == OFFGRAPH_KV_COMPILE_SPEC
+            and parse_offgraph_kv_manifest(spec.value)["layout"] == "cell"
+            for spec in compile_specs
+        )
+        for spec in compile_specs:
+            if spec.key == OFFGRAPH_KV_STEP_WIDTH_COMPILE_SPEC:
+                passes.append(
+                    CheckOffGraphKVStepWidthPass(
+                        spec.value, layout="cell" if cell_layout else "sequence"
+                    )
+                )
+        for spec in compile_specs:
+            if spec.key == OFFGRAPH_KV_COMPILE_SPEC:
+                passes.append(
+                    LowerOffGraphKVPass(parse_offgraph_kv_manifest(spec.value))
+                )
         if triton_kernel_mode == "ON":
             passes.append(ReplaceEdgeOpWithTritonOpPass())
         return passes
@@ -435,7 +1307,7 @@ class CudaBackend(AotiBackend, BackendDetails):
 
         # Configure CUDA environment variables based on detected version
 
-        emit_multi_arch_kernel = CudaBackend._setup_cuda_environment_for_fatbin()
+        emit_multi_arch_kernel = cls._should_include_ptx(compile_specs)
         # Base options for all platforms
 
         options: Dict[str, typing.Any] = {
@@ -451,8 +1323,11 @@ class CudaBackend(AotiBackend, BackendDetails):
             # Separate weight constants from the .so file
             "aot_inductor.package": True,
             "aot_inductor.package_constants_in_so": False,
-            # Store weight constants on disk in a binary blob
-            "aot_inductor.package_constants_on_disk_format": "binary_blob",
+            # Ask AOTI for structured constants. CUDABackend collects them by
+            # (device, FQN) and emits the tensor metadata needed at runtime.
+            "aot_inductor.package_constants_on_disk_format": cls._weights_format(
+                compile_specs
+            ),
             # Enable maximum automatic tuning for optimal performance
             "max_autotune": True,
             # Use TRITON for GEMM (General Matrix Multiply) operations tuning only to avoid using operators in libtorch
@@ -462,46 +1337,28 @@ class CudaBackend(AotiBackend, BackendDetails):
             "aot_inductor.emit_multi_arch_kernel": emit_multi_arch_kernel,
         }
 
-        try:
-            import torch
-
-            options["aot_inductor.custom_ops_to_c_shims"] = {
-                torch.ops.executorch_cuda.int4_plain_mm.default: [
-                    "AOTITorchError aoti_torch_cuda_int4_plain_mm("
-                    "AtenTensorHandle, AtenTensorHandle, AtenTensorHandle, "
-                    "AtenTensorHandle, AtenTensorHandle, AtenTensorHandle, "
-                    "int64_t, AtenTensorHandle*)"
-                ],
-                torch.ops.executorch_cuda.int5_plain_mm.default: [
-                    "AOTITorchError aoti_torch_cuda_int5_plain_mm("
-                    "AtenTensorHandle, AtenTensorHandle, AtenTensorHandle, "
-                    "AtenTensorHandle, AtenTensorHandle, AtenTensorHandle, "
-                    "AtenTensorHandle, int64_t, AtenTensorHandle*)"
-                ],
-                torch.ops.executorch_cuda.int6_plain_mm.default: [
-                    "AOTITorchError aoti_torch_cuda_int6_plain_mm("
-                    "AtenTensorHandle, AtenTensorHandle, AtenTensorHandle, "
-                    "AtenTensorHandle, AtenTensorHandle, int64_t, AtenTensorHandle*)"
-                ],
-                torch.ops.executorch_cuda.int8_plain_mm.default: [
-                    "AOTITorchError aoti_torch_cuda_int8_plain_mm("
-                    "AtenTensorHandle, AtenTensorHandle, AtenTensorHandle, "
-                    "AtenTensorHandle, int64_t, AtenTensorHandle*)"
-                ],
-            }
-        except AttributeError:
-            # quantize_op_dispatch not imported — op not registered, skip C shim mapping
-            pass
-
         # Parse compile_specs to check for platform
 
         platform = "linux"
+        emulate_precision_casts = True
+        max_autotune = True
+        autotune_at_compile_time = None
         shim_library_path = None
         for spec in compile_specs:
             if spec.key == "platform":
                 platform = spec.value.decode("utf-8")
-            if spec.key == "shim_library_path":
+            elif spec.key == "emulate_precision_casts":
+                emulate_precision_casts = _on_off_compile_spec_value(spec)
+            elif spec.key == "max_autotune":
+                max_autotune = _on_off_compile_spec_value(spec)
+            elif spec.key == "autotune_at_compile_time":
+                autotune_at_compile_time = _on_off_compile_spec_value(spec)
+            elif spec.key == "shim_library_path":
                 shim_library_path = spec.value.decode("utf-8")
+        options["emulate_precision_casts"] = emulate_precision_casts
+        options["max_autotune"] = max_autotune
+        if autotune_at_compile_time is not None:
+            options["triton.autotune_at_compile_time"] = autotune_at_compile_time
         # Add platform-specific options
 
         if platform == "windows":
@@ -509,6 +1366,16 @@ class CudaBackend(AotiBackend, BackendDetails):
 
             if shim_library_path is None:
                 lib_dir = resources.files("executorch").joinpath("data/lib")
+                # Only a CUDA build ships the import library, and a package directory
+                # that does not exist still reads back as an ordinary path rather than
+                # raising, so without this the failure surfaces from the linker instead.
+                if not lib_dir.joinpath("aoti_cuda_shims.lib").is_file():
+                    raise RuntimeError(
+                        "Lowering for Windows links against aoti_cuda_shims.lib, which "
+                        "only a CUDA build of executorch ships. Install a CUDA build, "
+                        "or pass a shim_library_path compile spec naming a directory "
+                        "that holds the import library."
+                    )
                 shim_library_path = str(lib_dir)
             options.update(
                 {
@@ -535,7 +1402,10 @@ class CudaBackend(AotiBackend, BackendDetails):
         compilation for the CUDA backend. Each manager is documented at
         its own `enter_context` call site below.
 
-        The low-memory export monkey-patch (CPU clones for mutated buffers)
+        The optional shared-memory target applies to every CUDA compilation,
+        and so does the small-GPU override that lets Inductor use Triton
+        templates below 68 SMs (skipped on ROCm). The low-memory export
+        monkey-patch (CPU clones for mutated buffers)
         is gated on the ``low_memory_mode`` compile spec — only models that
         explicitly opt in (currently Qwen3.5 MoE) get it. Other models go
         through the unmodified AOTI codepath, which avoids regressions in
@@ -544,6 +1414,9 @@ class CudaBackend(AotiBackend, BackendDetails):
         # Parse compile_specs for low_memory_mode (default OFF). compile_specs
         # may be None when called without specs (parity with base default).
         low_memory_mode = "OFF"
+        # On ROCm a failed capture invalidates the stream the rest of the
+        # compile runs on (hipErrorStreamCaptureInvalidated).
+        cuda_graph_autotune_timing = torch.version.hip is None
         for spec in compile_specs or []:
             if spec.key == "low_memory_mode":
                 mode = spec.value.decode("utf-8").upper()
@@ -552,6 +1425,13 @@ class CudaBackend(AotiBackend, BackendDetails):
                         f"Invalid low_memory_mode: {mode}. Expected 'ON' or 'OFF'."
                     )
                 low_memory_mode = mode
+            elif spec.key == CUDA_GRAPH_AUTOTUNE_TIMING_COMPILE_SPEC:
+                cuda_graph_autotune_timing = _on_off_compile_spec_value(spec)
+        cell_layout = any(
+            spec.key == OFFGRAPH_KV_COMPILE_SPEC
+            and parse_offgraph_kv_manifest(spec.value)["layout"] == "cell"
+            for spec in compile_specs or []
+        )
 
         @contextlib.contextmanager
         def _combined():
@@ -559,9 +1439,17 @@ class CudaBackend(AotiBackend, BackendDetails):
                 # Force any remaining PyTorch SDPA ops to use the MATH
                 # backend during compilation so AOTI can lower / decompose
                 # them. SDPA ops already replaced by Triton kernels via
-                # `ReplaceEdgeOpWithTritonOpPass` are unaffected; this is
-                # only the fallback for the `triton_kernel_mode="OFF"` path.
+                # `ReplaceEdgeOpWithTritonOpPass` are unaffected.
                 stack.enter_context(torch.nn.attention.sdpa_kernel([SDPBackend.MATH]))
+                stack.enter_context(triton_mutation_cache.enabled())
+                stack.enter_context(target_smem_context())
+                # Keep an unused libgomp out of the program, so it loads in a
+                # process without torch. See `_link_libraries_as_needed`.
+                stack.enter_context(_link_libraries_as_needed())
+                stack.enter_context(_pass_float_scalars_to_triton_as_floats())
+                # On ROCm, is_big_gpu gates on architecture, not SM count.
+                if torch.version.hip is None:
+                    stack.enter_context(_allow_triton_templates_on_small_gpus())
                 if low_memory_mode == "ON":
                     # Force AOTI's mutated-buffer clones onto CPU during
                     # compile so we stay under tight GPU memory caps (e.g.
@@ -571,8 +1459,42 @@ class CudaBackend(AotiBackend, BackendDetails):
                     # `low_memory_mode="ON"` compile spec, since the
                     # monkey-patch can interact poorly with other models'
                     # AOTI compile pipelines.
+                    stack.enter_context(_keep_triton_reduction_loads_loop_scoped())
                     stack.enter_context(
                         _compile_time_cpu_clones(torch.device(cls.get_device_name()))
+                    )
+                    trim_host_memory()
+                # Autotune the kernels that declare representative values
+                # for data-dependent arguments (e.g. a KV length) over those
+                # values instead of Inductor's zero-filled integer tensors.
+                # See autotune/inputs.py.
+                stack.enter_context(autotune_input_scenarios())
+                # Pick each @autotune_launch_param value (e.g. a split-K) by
+                # timing its candidates on this device. See
+                # autotune/launch_params.py.
+                stack.enter_context(
+                    autotune_launch_params(offload=_moved_program_tensors)
+                )
+                if cuda_graph_autotune_timing:
+                    # Time every autotune candidate (Inductor kernels, matmul
+                    # templates, our triton.autotune ops) with CUDA-graph
+                    # replays, so a CPU busy compiling does not decide the
+                    # pick. See autotune/cuda_graph_timing.py.
+                    stack.enter_context(
+                        cuda_graph_timing(offload=_moved_program_tensors)
+                    )
+                if cell_layout:
+                    # The cell layout's step buffers are constants the graph
+                    # only reads, while the runtime rewrites them before every
+                    # forward. Folding them, or inlining a small one as a
+                    # literal, would evaluate them at compile time -- on
+                    # storage that does not exist yet -- and bake the result
+                    # into the program.
+                    stack.enter_context(
+                        torch._inductor.config.patch(
+                            joint_graph_constant_folding=False,
+                            always_keep_tensor_constants=True,
+                        )
                     )
                 yield
 
@@ -585,6 +1507,13 @@ class CudaBackend(AotiBackend, BackendDetails):
             if spec.key == "low_memory_mode":
                 return spec.value.decode("utf-8").upper() == "ON"
         return False
+
+    @classmethod
+    def _weights_format(cls, compile_specs: List[CompileSpec]) -> str:
+        # CUDA consumes the structured AOTI output directly and emits a
+        # versioned per-FQN metadata payload. This is backend-wide rather than a
+        # model/export-script option.
+        return "pickle_weights"
 
     @classmethod
     def move_program_to_device(
@@ -606,8 +1535,11 @@ class CudaBackend(AotiBackend, BackendDetails):
         from torch.export.passes import move_to_device_pass
 
         if not cls._is_low_memory_mode(compile_specs):
-            return move_to_device_pass(edge_program, device)
-        return _move_to_device_resize_kv(edge_program, device)
+            moved = move_to_device_pass(edge_program, device)
+        else:
+            moved = _move_to_device_resize_kv(edge_program, device)
+        _track_moved_tensors(moved)
+        return moved
 
     @classmethod
     def release_moved_tensors(

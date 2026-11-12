@@ -9,13 +9,27 @@ import itertools
 from copy import deepcopy
 
 import executorch.backends.nxp.tests.executorch_pipeline as executorch_pipeline
-import executorch.backends.nxp.tests.models as models
+import executorch.backends.nxp.tests.simple_models as models
 import numpy as np
+
+# noinspection PyUnusedImports
 import pytest
 import torch
 
 from executorch.backends.nxp.backend.edge_program_converter import (
     EdgeProgramToIRConverter,
+)
+
+from executorch.backends.nxp.backend.ops_aliases import (
+    AddMM,
+    Convolution,
+    HardTanh,
+    MM,
+    NativebatchNormLegitNoStats,
+    NativebatchNormLegitNoTraining,
+    Relu,
+    Sigmoid,
+    Tanh,
 )
 
 from executorch.backends.nxp.quantizer.neutron_quantizer import NeutronQuantizer
@@ -30,8 +44,6 @@ from executorch.backends.nxp.tests.executors import (
     ToChannelFirstPreprocess,
     ToChannelLastPreprocess,
 )
-
-from executorch.exir.dialects._ops import ops as exir_ops
 
 requires_tflite = pytest.mark.skipif(
     tflite is None, reason="tensorflow/tflite not available"
@@ -50,13 +62,13 @@ from torchao.quantization.pt2e.quantize_pt2e import (
 )
 
 fuse_activation_ops = [
-    exir_ops.edge.aten.addmm.default,
-    exir_ops.edge.aten.mm.default,
-    exir_ops.edge.aten.convolution.default,
-    exir_ops.edge.aten.hardtanh.default,
-    exir_ops.edge.aten.relu.default,
-    exir_ops.edge.aten.sigmoid.default,
-    exir_ops.edge.aten.tanh.default,
+    AddMM,
+    MM,
+    Convolution,
+    HardTanh,
+    Relu,
+    Sigmoid,
+    Tanh,
 ]
 
 
@@ -74,8 +86,8 @@ all_activation_cases = list(
 ]
 
 batch_norm_ops = (
-    exir_ops.edge.aten._native_batch_norm_legit.no_stats,
-    exir_ops.edge.aten._native_batch_norm_legit_no_training.default,
+    NativebatchNormLegitNoStats,
+    NativebatchNormLegitNoTraining,
     torch.ops.aten._native_batch_norm_legit_no_training.default,
     torch.ops.aten.batch_norm.default,
     torch.ops.aten.native_batch_norm.default,
@@ -133,6 +145,37 @@ def test_quantizer_conv2d():
         nodes[12].target == torch.ops.quantized_decomposed.quantize_per_tensor.default
     )
     assert nodes[12].args[0].target == torch.ops.aten.conv2d.default
+
+
+def test_quantizer_non_strict_export():
+    class ConvConcatRelu(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(4, 4, 3, padding=1)
+
+        def forward(self, x):
+            return torch.relu(torch.cat((self.conv(x), self.conv(x)), dim=1))
+
+    example_input = (torch.ones(1, 4, 8, 8),)
+    exported_model = torch.export.export(
+        ConvConcatRelu().eval(), example_input, strict=False
+    )
+
+    m = _prepare_for_quantization(exported_model)
+    m(*example_input)
+    m = convert_pt2e(m)
+
+    convs = [n for n in m.graph.nodes if n.target == torch.ops.aten.conv2d.default]
+    assert len(convs) == 2
+    for conv in convs:
+        assert (
+            conv.args[0].target
+            == torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        )
+        assert (
+            conv.args[1].target
+            == torch.ops.quantized_decomposed.dequantize_per_channel.default
+        )
 
 
 def test_quantizer_linear():

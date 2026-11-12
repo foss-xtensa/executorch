@@ -1,5 +1,6 @@
 # Owner(s): ["oncall: mobile"]
 import copy
+import itertools
 import operator
 
 import torch
@@ -565,6 +566,28 @@ class TestXNNPACKQuantizer(PT2EQuantizationTestCase):
         ]
         self._test_quantizer(m, example_inputs, quantizer, node_occurrence, node_list)
 
+    def test_set_module_type_skips_cat_outside_the_module(self):
+        class M(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(5, 5)
+
+            def forward(self, x):
+                return torch.cat([self.linear(x), x], 1)
+
+        quantizer = XNNPACKQuantizer().set_module_type(
+            torch.nn.Linear, get_symmetric_quantization_config()
+        )
+        m = export(M().eval(), (torch.randn(3, 5),), strict=True).module()
+        m = quantizer.annotate(m)
+        annotated = {
+            node.target
+            for node in m.graph.nodes
+            if node.meta.get("quantization_annotation") is not None
+        }
+        self.assertIn(torch.ops.aten.linear.default, annotated)
+        self.assertNotIn(torch.ops.aten.cat.default, annotated)
+
     def test_set_module_type_case_2(self):
         class M(torch.nn.Module):
             def __init__(self) -> None:
@@ -710,6 +733,55 @@ class TestXNNPACKQuantizer(PT2EQuantizationTestCase):
                 True,
                 qconfig_mapping,
             )
+
+    def test_bf16_is_not_quantized(self):
+        class Cat(torch.nn.Module):
+            def forward(self, x):
+                return torch.cat([x, x.float()], 1)
+
+        class LinearMean(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(8, 8)
+
+            def forward(self, x):
+                return torch.mean(self.linear(x), -1, dtype=torch.bfloat16)
+
+        linear = torch.nn.Linear(8, 8).to(torch.bfloat16)
+        conv = torch.nn.Conv2d(3, 3, 1).to(torch.bfloat16)
+        x2d = torch.randn(9, 8, dtype=torch.bfloat16)
+        x4d = torch.randn(1, 3, 4, 4, dtype=torch.bfloat16)
+        cases = [
+            (linear, x2d),
+            (torch.nn.Sequential(linear, torch.nn.ReLU()), x2d),
+            (conv, x4d),
+            # The cat output is float32 but one of its inputs is bfloat16.
+            (Cat(), x4d),
+            # The linear is float32; only the mean it feeds is bfloat16.
+            (LinearMean(), x2d.float()),
+        ]
+        for (m_eager, x), is_dynamic in itertools.product(cases, (False, True)):
+            quantizer = XNNPACKQuantizer().set_global(
+                get_symmetric_quantization_config(
+                    is_per_channel=True, is_dynamic=is_dynamic
+                )
+            )
+            m = export(m_eager.eval(), (x,), strict=True).module()
+            m = prepare_pt2e(m, quantizer)
+            m(x)
+            m = convert_pt2e(m)
+            quantized = [
+                node.args[0].meta["val"].dtype
+                for node in m.graph.nodes
+                if node.target
+                in (
+                    torch.ops.quantized_decomposed.quantize_per_tensor.default,
+                    torch.ops.quantized_decomposed.quantize_per_tensor.tensor,
+                )
+            ]
+            self.assertNotIn(torch.bfloat16, quantized)
+            if isinstance(m_eager, LinearMean):
+                self.assertTrue(quantized)
 
     def test_dynamic_linear_int4_weight(self):
         quantizer = XNNPACKQuantizer()
@@ -1121,6 +1193,71 @@ class TestXNNPACKQuantizer(PT2EQuantizationTestCase):
             node_occurrence,
             node_list,
         )
+
+    def test_int64_scalar_add_used_as_index(self):
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return x[:, torch.arange(4) + 0]
+
+        quantizer = XNNPACKQuantizer()
+        quantization_config = get_symmetric_quantization_config(is_per_channel=True)
+        quantizer.set_global(quantization_config)
+        example_inputs = (torch.randn(1, 4, 5),)
+        m = export(M(), example_inputs, strict=True).module()
+        m = quantizer.transform_for_annotation(m)
+        m = prepare_pt2e(m, quantizer)
+        torch.testing.assert_close(m(*example_inputs), M()(*example_inputs))
+
+    def test_scalar_type_promotion(self):
+        class M(torch.nn.Module):
+            def __init__(self, op, scalar):
+                super().__init__()
+                self.op = op
+                self.scalar = scalar
+
+            def forward(self, x):
+                return self.op(x, self.scalar)
+
+        cases = [
+            (torch.float16, 1e-4, 100000.0),
+            (torch.float16, 1e-4, 100000),
+            (torch.float16, 10000.0, 1e-8),
+            (torch.bfloat16, 100.0, 1.0039),
+            (torch.float64, 1.0, 1.0 + 2**-30),
+            (torch.int64, 2**54 + 1, 1),
+            (torch.int32, 1, 1),
+            (torch.int32, 1, 2**31),
+            (torch.int8, 1, 256),
+            (torch.bool, True, False),
+            (torch.int32, 1, 0.5),
+            (torch.float32, 1.0, 2),
+            (torch.float32, 1.0, 1 + 2j),
+            (torch.complex64, 1j, 1 + 2j),
+        ]
+        for op, (dtype, value, scalar), shape, configured in itertools.product(
+            (torch.add, torch.mul), cases, ((), (2,)), (False, True)
+        ):
+            with self.subTest(
+                op=op, dtype=dtype, scalar=scalar, shape=shape, configured=configured
+            ):
+                model = M(op, scalar)
+                example_inputs = (torch.full(shape, value, dtype=dtype),)
+                expected = model(*example_inputs)
+                quantizer = XNNPACKQuantizer()
+                if configured:
+                    quantizer.set_global(get_symmetric_quantization_config())
+                m = export(model, example_inputs, strict=True).module()
+                m = prepare_pt2e(m, quantizer)
+                torch.testing.assert_close(m(*example_inputs), expected, rtol=0, atol=0)
+                if (
+                    configured
+                    and dtype == torch.float32
+                    and isinstance(scalar, complex)
+                ):
+                    m = convert_pt2e(m)
+                    torch.testing.assert_close(
+                        m(*example_inputs), expected, rtol=0, atol=0
+                    )
 
     def test_cat_same_node(self):
         """Ensure that concatenating the same node does not cause any unexpected behavior"""

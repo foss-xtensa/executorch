@@ -2,9 +2,9 @@
 #include <string.h>
 //#include "xa_nn_basic_state.h"
 #if CORE_HIFI5
-    #include <xa_nnlib_common_macros_hifi5.h>
+#include <xa_nnlib_common_macros_hifi5.h>
 #else
-    #include <xa_nnlib_common_macros.h>
+#include <xa_nnlib_common_macros.h>
 #endif
 
 #define ALIGNMENT_8   8

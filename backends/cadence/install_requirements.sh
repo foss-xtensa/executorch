@@ -11,38 +11,31 @@ reset=$(tput sgr0)
 
 EXECUTORCH_ROOT_PATH=$(realpath "$SCRIPT_DIR_PATH/../../")
 CADENCE_DIR_PATH="$EXECUTORCH_ROOT_PATH/backends/cadence"
-HIFI4_DIR_PATH="$CADENCE_DIR_PATH/hifi/third-party/nnlib/nnlib-hifi4"
-HIFI5_DIR_PATH="$CADENCE_DIR_PATH/hifi/third-party/nnlib/nnlib-hifi5"
 FUSION_DIR_PATH="$CADENCE_DIR_PATH/fusion_g3/third-party/nnlib/nnlib-FusionG3"
 FACTO_DIR_PATH="$CADENCE_DIR_PATH/utils/FACTO"
 
 cd "$EXECUTORCH_ROOT_PATH"
 
-## HiFi 4
-if [ -d "$HIFI4_DIR_PATH/.git" ]; then
-    echo "${green}ExecuTorch: hifi4 nnlib already cloned. Skipping...${reset}"
-else
-    rm -rf "$HIFI4_DIR_PATH"
-    echo "${green}ExecuTorch: Cloning hifi4 nnlib${reset}"
-    git clone "https://github.com/foss-xtensa/nnlib-hifi4.git" "$HIFI4_DIR_PATH"
-    if [ $? -ne 0 ]; then
-        echo "${red}ExecuTorch: Failed to clone hifi4 nnlib.${reset}"
-        exit 1
-    fi
-fi
+## HiFi
 
-## HiFi 5
-if [ -d "$HIFI5_DIR_PATH/.git" ]; then
-    echo "${green}ExecuTorch: hifi5 nnlib already cloned. Skipping...${reset}"
-else
-    rm -rf "$HIFI5_DIR_PATH"
-    echo "${green}ExecuTorch: Cloning hifi5 nnlib${reset}"
-    git clone "https://github.com/foss-xtensa/nnlib-hifi5.git" "$HIFI5_DIR_PATH"
-    if [ $? -ne 0 ]; then
-        echo "${red}ExecuTorch: Failed to clone hifi5 nnlib.${reset}"
+targets=(hifi4 hifi5)
+
+for target in ${targets[@]};
+do
+    TARGET_DIR_PATH="$CADENCE_DIR_PATH/hifi/third-party/nnlib/nnlib-$target"
+
+    rm -rf "$TARGET_DIR_PATH"
+    mkdir -p "$TARGET_DIR_PATH"
+
+    echo "${green}ExecuTorch: Cloning $target nnlib"
+    git clone "https://github.com/foss-xtensa/nnlib-$target.git" $TARGET_DIR_PATH
+    cd $TARGET_DIR_PATH
+    STATUS=$?
+    if [ $STATUS -ne 0 ]; then
+        echo "${red}ExecuTorch: Failed to clone $target nnlib."
         exit 1
     fi
-fi
+done
 
 ## Fusion G3
 if [ -d "$FUSION_DIR_PATH/.git" ]; then

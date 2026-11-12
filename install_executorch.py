@@ -191,6 +191,12 @@ def _parse_args() -> argparse.Namespace:
         help="Only installs necessary dependencies for core executorch and skips "
         " packages necessary for running example scripts.",
     )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Pass -v to pip when installing the ExecuTorch package.",
+    )
     allowed_optional_dependencies = ["ethos_u", "vgf", "openvino"]
     parser.add_argument(
         "--optional-dependency",
@@ -241,10 +247,15 @@ def main(args):
         + [
             package_spec,
             "--no-build-isolation",
-            "-v",
         ]
     )
-    subprocess.run(cmd, check=True)
+    if args.verbose:
+        cmd.append("-v")
+    package_env = os.environ.copy()
+    package_env["_EXECUTORCH_USE_PT_PINNED_COMMIT"] = (
+        "1" if args.use_pt_pinned_commit else "0"
+    )
+    subprocess.run(cmd, check=True, env=package_env)
 
     # Step 3: Extra (optional) packages that is only useful for running examples.
     if not args.minimal:

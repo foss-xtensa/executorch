@@ -239,6 +239,11 @@ def _annotate_linear_relu(
     return annotated_partitions
 
 
+def _is_1d_or_2d_conv(weight_shape: Optional[torch.Size]) -> bool:
+    # XNNPACK runs no other convs.
+    return weight_shape is None or len(weight_shape) <= 4
+
+
 def _do_annotate_conv(
     gm: torch.fx.GraphModule,
     quantization_config: Optional[QuantizationConfig],
@@ -273,9 +278,11 @@ def _do_annotate_conv(
         assert isinstance(weight, Node)
         weight_qspec = get_weight_qspec(quantization_config)
         num_groups = get_groups_from_conv(conv_node)
+        weight_shape = getattr(weight.meta.get("val", None), "shape", None)
 
         # skip if transposed conv has more than 1 group
         skip = skip or (is_conv_transpose and num_groups != 1)
+        skip = skip or not _is_1d_or_2d_conv(weight_shape)
 
         if is_conv_transpose:
             # transposed convs per output channel quantization
@@ -290,8 +297,6 @@ def _do_annotate_conv(
 
         # Only annotate dynamically quantized conv if it's 2D and not depthwise
         if is_dynamic:
-            weight_val = weight.meta.get("val", None)
-            weight_shape = getattr(weight_val, "shape", None)
             # Skip if not a 4D weight tensor (i.e. not conv2d)
             skip = skip or (weight_shape is not None and len(weight_shape) != 4)
             # Skip if depthwise (default to groups=1 since it's not an arg)
@@ -355,6 +360,7 @@ def _do_annotate_conv_relu(
         assert isinstance(weight, Node)
         weight_qspec = get_weight_qspec(quantization_config)
         groups = get_groups_from_conv(conv_node)
+        weight_shape = getattr(weight.meta.get("val", None), "shape", None)
         if is_conv_transpose:
             # transposed convs per output channel quantization
             weight_qspec = change_quantization_config(weight_qspec, ch_axis=1)
@@ -370,7 +376,7 @@ def _do_annotate_conv_relu(
         if _is_annotated(partition):
             continue
 
-        if is_conv_transpose and groups != 1:
+        if (is_conv_transpose and groups != 1) or not _is_1d_or_2d_conv(weight_shape):
             continue
 
         if filter_fn and any(not filter_fn(n) for n in partition):
@@ -789,6 +795,9 @@ def _annotate_add_relu(  # noqa: C901
         if filter_fn and any(not filter_fn(n) for n in partition):
             continue
 
+        if _is_input_non_float_tensor(add_node):
+            continue
+
         input_act_qspec = get_input_act_qspec(quantization_config)
         output_act_qspec = get_output_act_qspec(quantization_config)
 
@@ -843,6 +852,9 @@ def _annotate_add(
             continue
 
         if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        if _is_input_non_float_tensor(add_node):
             continue
 
         input_act_qspec = get_input_act_qspec(quantization_config)
@@ -913,6 +925,9 @@ def _annotate_mul_relu(  # noqa: C901
         if filter_fn and any(not filter_fn(n) for n in partition):
             continue
 
+        if _is_input_non_float_tensor(mul_node):
+            continue
+
         input_act_qspec = get_input_act_qspec(quantization_config)
         output_act_qspec = get_output_act_qspec(quantization_config)
 
@@ -967,6 +982,9 @@ def _annotate_mul(
             continue
 
         if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        if _is_input_non_float_tensor(mul_node):
             continue
 
         input_act_qspec = get_input_act_qspec(quantization_config)
@@ -1053,6 +1071,8 @@ def _annotate_cat(
     for cat_node in gm.graph.nodes:
         if cat_node.target != torch.ops.aten.cat.default:
             continue
+        if filter_fn and not filter_fn(cat_node):
+            continue
 
         if _is_annotated([cat_node]):
             continue
@@ -1102,14 +1122,31 @@ def _is_share_obs_or_fq_op(op: Callable) -> bool:
         torch.ops.aten.view_copy.default,
         torch.ops.aten.view.default,
         torch.ops.aten.reshape.default,
+        torch.ops.aten.slice.Tensor,
         torch.ops.aten.slice_copy.Tensor,
         torch.ops.aten.flatten.using_ints,
+        # Identity once not training, which is how a quantized model is deployed.
+        torch.ops.aten.dropout.default,
+        torch.ops.aten.dropout_.default,
     ]
+
+
+def touches_bfloat16(node: Node) -> bool:
+    """Whether a node reads or produces a bfloat16 tensor. The quantized kernels
+    do not take bfloat16 and XNNPACK leaves such patterns to them, where they
+    abort at run time, so these nodes are not quantized."""
+    return any(
+        isinstance(n.meta.get("val"), torch.Tensor)
+        and n.meta["val"].dtype == torch.bfloat16
+        for n in (node, *node.all_input_nodes)
+    )
 
 
 def propagate_annotation(model: torch.fx.GraphModule) -> None:
     for n in model.graph.nodes:
         if n.op != "call_function" or not _is_share_obs_or_fq_op(n.target):
+            continue
+        if touches_bfloat16(n):
             continue
 
         prev_node = n.args[0]
@@ -1150,21 +1187,26 @@ def _convert_scalars_to_attrs(model: torch.fx.GraphModule) -> torch.fx.GraphModu
         args = list(n.args)
         new_args = []
         for i in range(len(args)):
-            if isinstance(args[i], torch.fx.Node):
+            # Only FP32 binary ops need scalar lifting for quantization. Other
+            # dtypes must retain Python scalar promotion and rounding semantics.
+            if (
+                isinstance(args[i], torch.fx.Node)
+                or n.meta["val"].dtype != torch.float32
+            ):
                 new_args.append(args[i])
                 continue
             prefix = "_tensor_constant_"
             get_new_attr_name = get_new_attr_name_with_prefix(prefix)
             tensor_constant_name = get_new_attr_name(model)
-            float_tensor = torch.tensor(float(args[i]))
-            model.register_buffer(tensor_constant_name, float_tensor)
+            scalar_tensor = torch.tensor(args[i], dtype=n.meta["val"].dtype)
+            model.register_buffer(tensor_constant_name, scalar_tensor)
             fake_mode = n.meta["val"].fake_mode
             with model.graph.inserting_before(n):
                 get_attr_node = model.graph.create_node(
                     "get_attr", tensor_constant_name, (), {}
                 )
                 get_attr_node.meta["val"] = fake_mode.from_tensor(
-                    float_tensor, static_shapes=True
+                    scalar_tensor, static_shapes=True
                 )
                 new_args.append(get_attr_node)
         n.args = tuple(new_args)

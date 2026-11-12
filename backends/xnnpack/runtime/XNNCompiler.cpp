@@ -15,6 +15,7 @@
 #include <cinttypes>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #pragma clang diagnostic ignored "-Wmissing-prototypes"
@@ -28,7 +29,6 @@ namespace delegate {
 using executorch::ET_RUNTIME_NAMESPACE::NamedDataMap;
 using executorch::runtime::Error;
 using executorch::runtime::FreeableBuffer;
-using executorch::runtime::MemoryAllocator;
 using executorch::runtime::Result;
 
 /*
@@ -793,6 +793,104 @@ Error defineConvertNode(
   return Error::Ok;
 };
 /*
+Look up a serialized tensor value (plain or quantized wrapper) by its
+output id. Returns nullptr if not found.
+*/
+const fb_xnnpack::XNNTensorValue* getSerializedTensorValue(
+    const fb_xnnpack::XNNGraph* graph,
+    uint32_t id) noexcept {
+  if (graph == nullptr || graph->xvalues() == nullptr) {
+    return nullptr;
+  }
+  for (auto value : *graph->xvalues()) {
+    const fb_xnnpack::XNNTensorValue* tv = nullptr;
+    if (value->xvalue_union_type() == fb_xnnpack::XValueUnion::XNNTensorValue) {
+      tv = value->xvalue_union_as_XNNTensorValue();
+    } else if (
+        value->xvalue_union_type() ==
+        fb_xnnpack::XValueUnion::XNNQuantizedTensorValue) {
+      tv = value->xvalue_union_as_XNNQuantizedTensorValue()->tensor_value();
+    }
+    if (tv != nullptr && tv->id_out() == id) {
+      return tv;
+    }
+  }
+  return nullptr;
+}
+
+/*
+XNNPACK multiplies bf16 matrices only into an fp32 result. When the serialized
+graph multiplies bf16 matrices into a bf16 output, define an fp32 value for the
+op to write instead, which convertBf16MatMulResult() then converts into the
+output, so the delegate boundary stays bf16. Otherwise the op writes the output
+itself.
+*/
+Error defineBf16MatMulResult(
+    xnn_subgraph_t subgraph_ptr,
+    const fb_xnnpack::XNNGraph* graph,
+    uint32_t input1_id,
+    uint32_t input2_id,
+    uint32_t output_id,
+    uint32_t remapped_output_id,
+    const NodePtr node,
+    uint32_t* result_id) noexcept {
+  *result_id = remapped_output_id;
+  const auto* input1 = getSerializedTensorValue(graph, input1_id);
+  const auto* input2 = getSerializedTensorValue(graph, input2_id);
+  const auto* output = getSerializedTensorValue(graph, output_id);
+  if (input1 == nullptr || input2 == nullptr || output == nullptr ||
+      input1->datatype() != DataType::xnn_datatype_bf16 ||
+      input2->datatype() != DataType::xnn_datatype_bf16 ||
+      output->datatype() != DataType::xnn_datatype_bf16) {
+    return Error::Ok;
+  }
+  // Like defineTensor(), treat a null dims vector as rank 0.
+  std::vector<size_t> dims;
+  if (output->dims() != nullptr) {
+    dims = flatbufferDimsToVector<size_t>(output->dims());
+  }
+  xnn_status status = xnn_define_tensor_value(
+      subgraph_ptr,
+      xnn_datatype_fp32,
+      dims.size(),
+      dims.data(),
+      /*data=*/nullptr,
+      /*external_id=*/XNN_INVALID_VALUE_ID,
+      /*flags=*/0,
+      result_id);
+  ET_CHECK_OR_RETURN_ERROR(
+      status == xnn_status_success,
+      Internal,
+      "Failed to define the fp32 result of bf16 node %i: %s",
+      node->debug_handle(),
+      xnn_status_to_string(status));
+  return Error::Ok;
+}
+
+/*
+Converts the fp32 result that defineBf16MatMulResult() defined into the bf16
+output. Does nothing when the op wrote the output itself.
+*/
+Error convertBf16MatMulResult(
+    xnn_subgraph_t subgraph_ptr,
+    uint32_t result_id,
+    uint32_t remapped_output_id,
+    const NodePtr node) noexcept {
+  if (result_id == remapped_output_id) {
+    return Error::Ok;
+  }
+  xnn_status status = xnn_define_convert(
+      subgraph_ptr, result_id, remapped_output_id, /*flags=*/0);
+  ET_CHECK_OR_RETURN_ERROR(
+      status == xnn_status_success,
+      Internal,
+      "Failed to convert the result of bf16 node %i to bf16: %s",
+      node->debug_handle(),
+      xnn_status_to_string(status));
+  return Error::Ok;
+}
+
+/*
 Define serialized linear(fully-connected) node into the subgraph using
 the remapped ids to map the serialized ids, to the new ids generated
 when defining the tensor values
@@ -802,14 +900,23 @@ Error defineFullyConnectedNode(
     const std::unordered_map<uint32_t, uint32_t>& remapped_ids,
     const NodePtr node,
     const fb_xnnpack::XNNGraph* graph) noexcept {
-  MAYBE_UNUSED(graph);
-
   auto graph_node = node->xnode_union_as_XNNFullyConnected();
   std::pair<float, float> min_max = getOutputMinMax(node);
   REMAP_ID(remapped_ids, graph_node->input1_id(), fc_input1);
   REMAP_ID(remapped_ids, graph_node->filter_id(), fc_filter);
   REMAP_ID(remapped_ids, graph_node->bias_id(), fc_bias);
   REMAP_ID(remapped_ids, graph_node->output_id(), fc_output);
+
+  uint32_t fc_result = XNN_INVALID_VALUE_ID;
+  ET_CHECK_OK_OR_RETURN_ERROR(defineBf16MatMulResult(
+      subgraph_ptr,
+      graph,
+      graph_node->input1_id(),
+      graph_node->filter_id(),
+      graph_node->output_id(),
+      fc_output,
+      node,
+      &fc_result));
 
   xnn_status status = xnn_define_fully_connected(
       subgraph_ptr,
@@ -818,7 +925,7 @@ Error defineFullyConnectedNode(
       fc_input1,
       fc_filter,
       fc_bias,
-      fc_output,
+      fc_result,
       graph_node->flags());
   ET_CHECK_OR_RETURN_ERROR(
       status == xnn_status_success,
@@ -827,7 +934,7 @@ Error defineFullyConnectedNode(
       node->debug_handle(),
       xnn_status_to_string(status));
 
-  return Error::Ok;
+  return convertBf16MatMulResult(subgraph_ptr, fc_result, fc_output, node);
 };
 
 /*
@@ -1627,15 +1734,24 @@ Error defineBatchMatrixMultiplyNode(
     const std::unordered_map<uint32_t, uint32_t>& remapped_ids,
     const NodePtr node,
     const fb_xnnpack::XNNGraph* graph) noexcept {
-  MAYBE_UNUSED(graph);
-
   auto graph_node = node->xnode_union_as_XNNBatchMatrixMultiply();
   REMAP_ID(remapped_ids, graph_node->input1_id(), bmm_in1);
   REMAP_ID(remapped_ids, graph_node->input2_id(), bmm_in2);
   REMAP_ID(remapped_ids, graph_node->output_id(), bmm_out);
 
+  uint32_t bmm_result = XNN_INVALID_VALUE_ID;
+  ET_CHECK_OK_OR_RETURN_ERROR(defineBf16MatMulResult(
+      subgraph_ptr,
+      graph,
+      graph_node->input1_id(),
+      graph_node->input2_id(),
+      graph_node->output_id(),
+      bmm_out,
+      node,
+      &bmm_result));
+
   xnn_status status = xnn_define_batch_matrix_multiply(
-      subgraph_ptr, bmm_in1, bmm_in2, bmm_out, graph_node->flags());
+      subgraph_ptr, bmm_in1, bmm_in2, bmm_result, graph_node->flags());
 
   ET_CHECK_OR_RETURN_ERROR(
       status == xnn_status_success,
@@ -1644,7 +1760,7 @@ Error defineBatchMatrixMultiplyNode(
       node->debug_handle(),
       xnn_status_to_string(status));
 
-  return Error::Ok;
+  return convertBf16MatMulResult(subgraph_ptr, bmm_result, bmm_out, node);
 }
 
 /*
@@ -1905,6 +2021,7 @@ _DEFINE_UNARY_NODE_NO_PARAMS(
     xnn_unary_reciprocal_square_root)
 _DEFINE_UNARY_NODE_NO_PARAMS(Ceiling, xnn_unary_ceiling)
 _DEFINE_UNARY_NODE_NO_PARAMS(Gelu, xnn_unary_gelu)
+_DEFINE_UNARY_NODE_NO_PARAMS(ApproxGelu, xnn_unary_approxgelu)
 _DEFINE_UNARY_NODE_NO_PARAMS(Hardswish, xnn_unary_hardswish)
 _DEFINE_UNARY_NODE_NO_PARAMS(Log, xnn_unary_log)
 _DEFINE_UNARY_NODE_NO_PARAMS(Negate, xnn_unary_negate)
@@ -1946,6 +2063,7 @@ DefineNodeFunc getDefineNodeFunc(fb_xnnpack::XNodeUnion nodeType) {
     _DEFINE(ReciprocalSquareRoot)
     _DEFINE(Ceiling)
     _DEFINE(Gelu)
+    _DEFINE(ApproxGelu)
     _DEFINE(Hardswish)
     _DEFINE(Log)
     _DEFINE(Tanh)
@@ -1989,6 +2107,58 @@ DefineNodeFunc getDefineNodeFunc(fb_xnnpack::XNodeUnion nodeType) {
   }
 }
 #undef _DEFINE
+
+/*
+Serialized id of an xvalue, or XNN_INVALID_VALUE_ID if it is not a tensor.
+*/
+uint32_t getSerializedValueId(ValuePtr value) noexcept {
+  const fb_xnnpack::XNNTensorValue* tensor_value = nullptr;
+  if (value->xvalue_union_type() == fb_xnnpack::XValueUnion::XNNTensorValue) {
+    tensor_value = value->xvalue_union_as_XNNTensorValue();
+  } else if (
+      value->xvalue_union_type() ==
+      fb_xnnpack::XValueUnion::XNNQuantizedTensorValue) {
+    tensor_value =
+        value->xvalue_union_as_XNNQuantizedTensorValue()->tensor_value();
+  }
+  return tensor_value != nullptr ? tensor_value->id_out()
+                                 : XNN_INVALID_VALUE_ID;
+}
+
+/*
+Serialized ids of the values that XNNPACK copies into its own packed storage
+while the runtime is created. Every other constant value is referenced by raw
+pointer for the lifetime of the runtime.
+*/
+std::unordered_set<uint32_t> getPackedValueIds(GraphPtr flatbuffer_graph) {
+  std::unordered_set<uint32_t> packed_ids;
+  auto insert_weights = [&packed_ids](uint32_t filter_id, uint32_t bias_id) {
+    packed_ids.insert(filter_id);
+    if (bias_id != XNN_INVALID_VALUE_ID) {
+      packed_ids.insert(bias_id);
+    }
+  };
+
+  // Deliberately an if-chain rather than a switch: XNodeUnion has ~50
+  // enumerators and -Wswitch-enum requires every one of them to be listed.
+  for (auto node : *flatbuffer_graph->xnodes()) {
+    auto type = node->xnode_union_type();
+    if (type == fb_xnnpack::XNodeUnion::XNNFullyConnected) {
+      auto n = node->xnode_union_as_XNNFullyConnected();
+      insert_weights(n->filter_id(), n->bias_id());
+    } else if (type == fb_xnnpack::XNodeUnion::XNNConv2d) {
+      auto n = node->xnode_union_as_XNNConv2d();
+      insert_weights(n->filter_id(), n->bias_id());
+    } else if (type == fb_xnnpack::XNodeUnion::XNNDepthwiseConv2d) {
+      auto n = node->xnode_union_as_XNNDepthwiseConv2d();
+      insert_weights(n->filter_id(), n->bias_id());
+    } else if (type == fb_xnnpack::XNodeUnion::XNNConvTranspose2d) {
+      auto n = node->xnode_union_as_XNNConvTranspose2d();
+      insert_weights(n->filter_id(), n->bias_id());
+    }
+  }
+  return packed_ids;
+}
 
 /*
 Builds the xnnpack runtime object using the buffer pointer. The buffer pointer
@@ -2094,15 +2264,23 @@ ET_NODISCARD Error XNNCompiler::compileModel(
   // Invalid ids do not need to be remapped
   remapped_ids.emplace(XNN_INVALID_VALUE_ID, XNN_INVALID_VALUE_ID);
 
-  // If weight cache is not on we hold onto all the unpacked buffers
-  // and we free them at the end
+  // Buffers loaded from the named data map for values whose data XNNPACK packs
+  // during runtime creation. They stay alive until the runtime exists and are
+  // freed afterwards.
   std::vector<FreeableBuffer> unpacked_buffers;
+  const std::unordered_set<uint32_t> packed_value_ids =
+      getPackedValueIds(flatbuffer_graph);
 
   // External Ids for inputs and outputs
   std::vector<uint32_t> input_ids;
   std::vector<uint32_t> output_ids;
   Error err = Error::Ok;
   for (auto value : *flatbuffer_graph->xvalues()) {
+    size_t prev_buffers = unpacked_buffers.size();
+    // With the weights cache the buffers land in the cache rather than in
+    // unpacked_buffers, so track its list too.
+    size_t prev_cached_buffers =
+        use_weight_cache ? weights_cache->get_num_unpacked_data() : 0;
     err = defineTensor(
         subgraph.get(),
         remapped_ids,
@@ -2120,6 +2298,21 @@ ET_NODISCARD Error XNNCompiler::compileModel(
 
     if (err != Error::Ok) {
       return err;
+    }
+
+    // Operators that don't pack (PReLU, for example) keep raw pointers into
+    // the constant data, so hand their buffers to the executor. A single value
+    // can contribute more than one buffer: a quantized weight also loads its
+    // scales.
+    if (packed_value_ids.count(getSerializedValueId(value)) == 0) {
+      for (size_t i = prev_buffers; i < unpacked_buffers.size(); i++) {
+        executor->unpacked_buffers_.push_back(std::move(unpacked_buffers[i]));
+      }
+      unpacked_buffers.resize(prev_buffers);
+      if (use_weight_cache) {
+        weights_cache->take_unpacked_data_from(
+            prev_cached_buffers, executor->unpacked_buffers_);
+      }
     }
   }
 
@@ -2168,6 +2361,8 @@ ET_NODISCARD Error XNNCompiler::compileModel(
 
   std::vector<std::string> packed_weights_names;
   if (use_weight_cache) {
+    // Constants XNNPACK does not pack were already moved to the executor in
+    // the value loop above, so everything left here is safe to free.
     auto packed_weights_names_result = weights_cache->finalize_for_runtime();
     ET_CHECK_OR_RETURN_ERROR(
         packed_weights_names_result.ok(),
@@ -2175,6 +2370,7 @@ ET_NODISCARD Error XNNCompiler::compileModel(
         "Failed to finalize weights cache after creating the xnn runtime");
     packed_weights_names = std::move(packed_weights_names_result.get());
   } else {
+    // XNNPACK has copied these into its own packed storage.
     for (auto& buffer : unpacked_buffers) {
       buffer.Free();
     }
