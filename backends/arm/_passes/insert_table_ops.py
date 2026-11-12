@@ -61,11 +61,13 @@ class TableOps:
         exir_ops.edge.aten.acos.default: torch.acos,
         exir_ops.edge.aten.tan.default: torch.tan,
         exir_ops.edge.aten.silu.default: torch.nn.functional.silu,
+        exir_ops.edge.aten.mish.default: torch.nn.functional.mish,
         exir_ops.edge.aten.round.default: torch.round,
     }
 
     # Targets that must be treated explicitly
     special_table_ops: Set[EdgeOpOverload] = {
+        exir_ops.edge.aten.softplus.default,
         exir_ops.edge.aten.pow.Tensor_Scalar,
         exir_ops.edge.aten.gelu.default,
         exir_ops.edge.aten.elu.default,
@@ -87,6 +89,26 @@ class TableOps:
             return self.unary_table_ops[target]
         elif target in self.special_table_ops:
             match target:
+                case exir_ops.edge.aten.softplus.default:
+                    beta = cast(
+                        float,
+                        (
+                            node.args[1]
+                            if len(node.args) > 1
+                            else node.kwargs.get("beta", 1)
+                        ),
+                    )
+                    threshold = cast(
+                        float,
+                        (
+                            node.args[2]
+                            if len(node.args) > 2
+                            else node.kwargs.get("threshold", 20)
+                        ),
+                    )
+                    return lambda x: torch.nn.functional.softplus(
+                        x, beta=beta, threshold=threshold
+                    ).flatten()
                 case exir_ops.edge.aten.pow.Tensor_Scalar:
                     # Exponent is a constant. Embed it into a lambda.
                     exp = cast(int, node.args[1])
