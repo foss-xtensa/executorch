@@ -611,15 +611,11 @@ int main(int argc, char** argv) {
 
   xt_iss_client_command("all", "disable");
   xt_iss_client_command("all", "enable");
-  struct tms t_start, t_stop;
-  times(&t_start);
+  const unsigned long long cycle_start = xt_iss_cycle_count();
   const Error exec_status = method->execute();
-  times(&t_stop);
+  const unsigned long long cycle_stop = xt_iss_cycle_count();
   xt_iss_client_command("all", "disable");
-  ET_LOG(
-      Info,
-      "Execute cycles = %ld",
-      static_cast<long>(t_stop.tms_utime - t_start.tms_utime));
+  ET_LOG(Info, "Execute cycles = %llu", cycle_stop - cycle_start);
 
   ET_CHECK_MSG(
       exec_status == Error::Ok,

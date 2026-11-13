@@ -79,33 +79,6 @@ if(EXECUTORCH_NNLIB_OPT)
   set(TARGET_DIR hifi)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
-elseif(EXECUTORCH_HIFI_CORE STREQUAL "hifi1" OR EXECUTORCH_HIFI_CORE STREQUAL
-                                                "hifi4"
-)
-  add_compile_definitions(CORE_HIFI5=0)
-  list(APPEND EXECUTORCH_EXTRA_BUCK_FLAGS "--config" "cadence.hifi_core=hifi4")
-  set(TARGET_DIR hifi)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
-elseif(EXECUTORCH_HIFI_CORE STREQUAL "hifi5")
-  add_compile_definitions(CORE_HIFI5=1)
-  list(APPEND EXECUTORCH_EXTRA_BUCK_FLAGS "--config" "cadence.hifi_core=hifi5")
-  set(TARGET_DIR hifi)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
-elseif(
-  EXECUTORCH_HIFI_CORE STREQUAL "hifi1"
-  OR EXECUTORCH_HIFI_CORE STREQUAL "hifi4"
-  OR EXECUTORCH_HIFI_CORE STREQUAL "hifi5"
-)
-  if(EXECUTORCH_HIFI_CORE STREQUAL "hifi5")
-    add_compile_definitions(CORE_HIFI5=1)
-  else()
-    add_compile_definitions(CORE_HIFI5=0)
-  endif()
-  set(TARGET_DIR hifi)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/third-party/nnlib)
-  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/${TARGET_DIR}/kernels)
 elseif(
   EXECUTORCH_HIFI_CORE STREQUAL "hifi1"
   OR EXECUTORCH_HIFI_CORE STREQUAL "hifi4"
